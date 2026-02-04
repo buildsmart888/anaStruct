@@ -37,7 +37,12 @@ class SimpleBeam(Beam):
 
 
 class CantileverBeam(Beam):
-    """Cantilever beam with a fixed support at one end, and free at the other."""
+    """Cantilever beam with a fixed support at one end and free at the other.
+
+    The ``cantilever_side`` parameter specifies which end is the free (unsupported)
+    end. For example, ``cantilever_side="right"`` means the right end is free and
+    the left end is fixed.
+    """
 
     def __init__(
         self,
@@ -46,17 +51,17 @@ class CantileverBeam(Beam):
         angle: float = 0.0,
         section: Optional[SectionProps] = None,
     ) -> None:
-        super().__init__(
-            length=length,
-            angle=angle,
-            section=section,
-        )
         self.cantilever_side = cantilever_side.lower()
         if self.cantilever_side not in ["left", "right"]:
             raise ValueError(
                 "cantilever_side must be either 'left' or 'right', "
                 f"got '{cantilever_side}'"
             )
+        super().__init__(
+            length=length,
+            angle=angle,
+            section=section,
+        )
 
     @property
     def type(self) -> str:
@@ -72,7 +77,7 @@ class CantileverBeam(Beam):
 
 
 class RightCantileverBeam(CantileverBeam):
-    """Cantilever beam with a fixed support at the left end, and free at the right."""
+    """Cantilever beam with a fixed support at the left end and free (cantilevered) at the right."""
 
     def __init__(
         self,
@@ -93,7 +98,7 @@ class RightCantileverBeam(CantileverBeam):
 
 
 class LeftCantileverBeam(CantileverBeam):
-    """Cantilever beam with a free support at the left end, and fixed at the right."""
+    """Cantilever beam with a free (cantilevered) left end and a fixed support at the right."""
 
     def __init__(
         self,
@@ -131,22 +136,23 @@ class MultiSpanBeam(Beam):
             raise ValueError("Only one of num_spans or span_lengths may be provided.")
         if num_spans is not None and length is None:
             raise ValueError("If num_spans is provided, length must also be provided.")
-        if num_spans is not None and length is not None:
-            span_lengths = [length / num_spans] * num_spans
-
-        super().__init__(
-            length=sum(span_lengths) if span_lengths else num_spans,
-            span_lengths=span_lengths,
-            angle=angle,
-            section=section,
-        )
-        self.num_spans = num_spans
         if cantilevers not in [None, "left", "right", "both"]:
             raise ValueError(
                 "cantilevers must be either None, 'left', 'right', or 'both', "
                 f"got '{cantilevers}'"
             )
+        if num_spans is not None and length is not None:
+            span_lengths = [length / num_spans] * num_spans
+
+        # Set attributes needed by define_supports() before super().__init__()
+        self.num_spans = num_spans
         self.cantilevers = cantilevers
+
+        super().__init__(
+            span_lengths=span_lengths,
+            angle=angle,
+            section=section,
+        )
 
     @property
     def type(self) -> str:
@@ -173,7 +179,7 @@ class MultiSpanBeam(Beam):
             else len(self.span_lengths) - 1
         )
         self.support_definitions[first_support] = "pinned"
-        for i in range(first_support + 1, last_support):
+        for i in range(first_support + 1, last_support + 1):
             self.support_definitions[i] = "roller"
 
 

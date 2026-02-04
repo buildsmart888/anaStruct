@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Iterable, Literal, Optional, Sequence, Union, overload
+from typing import Iterable, Literal, Optional, Sequence, Union
 
 import numpy as np
 
@@ -22,14 +22,13 @@ class Beam(ABC):
     node generation, connectivity, and support definitions. Subclasses implement
     specific beam types (simple, cantilever, etc.).
 
-    The beam generation follows a three-phase process:
-    1. define_nodes() - Generate node coordinates
-    2. define_connectivity() - Define which nodes connect to form elements
-    3. define_supports() - Define support locations and types
+    The beam generation follows a two-phase process:
+    1. define_nodes() - Generate node coordinates and span connectivity
+    2. define_supports() - Define support locations and types
 
     Attributes:
         length (float): Total length of the beam (length units)
-        angle (float): Angle of the beam (degrees; 0 = horizontal, positive = CCW); defauts to 0.0
+        angle (float): Angle of the beam (degrees; 0 = horizontal, positive = CCW); defaults to 0.0
         section (SectionProps): Section properties for all beam elements; defaults to DEFAULT_BEAM_SECTION
         supports_type (Literal["simple", "pinned", "fixed"]): Type of supports to apply; defaults to "simple"
         system (SystemElements): The FEM system containing all nodes, elements, and supports; initialized after adding elements
@@ -61,16 +60,21 @@ class Beam(ABC):
         angle: float = 0.0,
         section: Optional[SectionProps] = None,
     ):
-        """Initialize a truss structure.
+        """Initialize a beam structure.
 
         Args:
-            length (float): Total length of the beam (length units). Must be positive. Either length or span_lengths must be provided.
-            span_lengths (list[float]): List of span lengths for each span. Must be positive. Either length or span_lengths must be provided.
-            angle (float): Angle of the truss (degrees; 0 = horizontal, positive = CCW); defaults to 0.0
-            section (SectionProps): Section properties for all beam elements; defaults to DEFAULT_BEAM_SECTION
+            length (float): Total length of the beam (length units). Must be positive.
+                Either length or span_lengths must be provided.
+            span_lengths (list[float]): List of span lengths for each span. Must be
+                positive. Either length or span_lengths must be provided.
+            angle (float): Angle of the beam (degrees; 0 = horizontal, positive = CCW);
+                defaults to 0.0
+            section (SectionProps): Section properties for all beam elements; defaults
+                to DEFAULT_BEAM_SECTION
 
         Raises:
-            ValueError: If width or height is not positive.
+            ValueError: If length or span_lengths are not positive, or if neither
+                (or both) are provided.
         """
         if length is None and span_lengths is None:
             raise ValueError("Either length or span_lengths must be provided.")
@@ -89,9 +93,13 @@ class Beam(ABC):
             self.length = length
             self.span_lengths = [length]
 
-        if angle > -np.pi / 2 and angle < np.pi / 2:
-            print(
-                f"Warning: A very small angle was provided ({angle}). Please ensure input units are degrees."
+        if angle != 0.0 and -2 * np.pi <= angle <= 2 * np.pi:
+            import warnings
+
+            warnings.warn(
+                f"A very small angle was provided ({angle}). "
+                f"Please ensure input units are degrees, not radians.",
+                stacklevel=2,
             )
         if angle < 0 or angle >= 360:
             angle = angle % 360
@@ -242,8 +250,6 @@ class Beam(ABC):
             rotation (Optional[Union[float, Sequence[float]]]): Rotation angle in degrees
                 (used with direction="angle")
             q_perp (Optional[Union[float, Sequence[float]]]): Perpendicular load component
-            chord_segment (Optional[str]): If specified, apply load only to this segment
-                (for trusses with segmented chords like roof trusses)
         """
         element_ids = self.get_element_ids_of_spans(spans=spans)
         for el_id in element_ids:
@@ -310,11 +316,14 @@ class Beam(ABC):
                 if relative_location < 0 or relative_location > 1.0:
                     continue
                 # Compute absolute location within the span
-                absolute_location = relative_location * span_length
-            assert absolute_location is not None
+                span_abs_location = relative_location * span_length
+            else:
+                assert absolute_location is not None
+                span_abs_location = absolute_location
+
             # Compute load location
-            load_x = span_start.x + self.dx * absolute_location
-            load_y = span_start.y + self.dy * absolute_location
+            load_x = span_start.x + self.dx * span_abs_location
+            load_y = span_start.y + self.dy * span_abs_location
 
             # Determine if a node already exists at (or very near to) the load location
             node_id = self.system.find_node_id(
@@ -334,7 +343,7 @@ class Beam(ABC):
                     )
                     elem_end = elem_start + elem_length
 
-                    if elem_start <= absolute_location <= elem_end:
+                    if elem_start <= span_abs_location <= elem_end:
                         # Insert node into this element
                         result = self.system.insert_node(
                             element_id=elem_id, location=Vertex(load_x, load_y)
@@ -353,9 +362,9 @@ class Beam(ABC):
             self.system.point_load(node_id=node_id, Fx=Fx, Fy=Fy, rotation=rotation)
 
     def validate(self) -> bool:
-        """Validate truss geometry and connectivity.
+        """Validate beam geometry and connectivity.
 
-        Checks for common truss definition issues:
+        Checks for common beam definition issues:
         - All node IDs in span lists reference valid nodes
         - No duplicate nodes at the same location
         - All elements have non-zero length
@@ -415,5 +424,5 @@ class Beam(ABC):
         return True
 
     def show_structure(self) -> None:
-        """Display the truss structure using matplotlib."""
+        """Display the beam structure using matplotlib."""
         self.system.show_structure()
