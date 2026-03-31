@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Continuous Beam Analyzer PRO",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["continuous_beam_gui.py"],
+      "port": 0
+    }
+  ]
+}
