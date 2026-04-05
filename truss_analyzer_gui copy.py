@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import math
+import copy
 import csv
 from tkinter import filedialog, messagebox
 
@@ -24,6 +25,11 @@ except (ImportError, TypeError) as e:
     ANACSTRUCT_AVAILABLE = False
     AnaStructSystemElements = None
     FEMException = Exception
+
+from truss_model import TrussModel
+from truss_generators import TrussGenerators
+from truss_analysis import TrussAnalysisEngine, calculate_buckling_stress, check_member_stability
+from truss_exporter import TrussExporter
 
 # Wrapper for anaStruct to integrate with GUI
 class TrussAnalyzer:
@@ -77,9 +83,9 @@ class TrussAnalyzer:
         """Check structure stability"""
         return self.ss.validate()
         
-    def show_structure(self, show=False):
+    def show_structure(self, show=False, verbosity=0):
         """Visualize structure using base anastruct method"""
-        return self.ss.show_structure(show=show)
+        return self.ss.show_structure(show=show, verbosity=verbosity)
         
     def show_displacement(self, show=False, factor=500):
         """Visualize displacements"""
@@ -157,12 +163,24 @@ class TrussAnalyzer:
         loads = {}
         if hasattr(self.ss, 'loads_point') and self.ss.loads_point:
             for node_id, load_data in self.ss.loads_point.items():
-                # loads_point is a list of tuples for each node
                 loads[node_id] = {
                     'Fx': load_data[0][0] if load_data and load_data[0] else 0,
                     'Fy': load_data[0][1] if load_data and load_data[0] else 0
                 }
         return loads
+
+    @property
+    def reaction_forces(self):
+        """Reaction forces at support nodes: {node_id: {'x', 'y', 'Fx', 'Fy'}}"""
+        reactions = {}
+        for nid, node in self.ss.reaction_forces.items():
+            reactions[nid] = {
+                'x': node.vertex.x,
+                'y': node.vertex.y,
+                'Fx': node.Fx,
+                'Fy': node.Fy,
+            }
+        return reactions
 
 # Use real FEA solver
 SystemElements = TrussAnalyzer
@@ -207,19 +225,50 @@ LOAD_COMBINATIONS = {
     }
 }
 
-# --- Modern Design System ---
-COLOR_PALETTE = {
-    "primary": "#2563EB",        # Modern Blue
-    "secondary": "#7C3AED",     # Purple
-    "success": "#059669",       # Emerald
-    "warning": "#D97706",       # Amber
-    "danger": "#DC2626",        # Red
-    "surface": "#1F2937",       # Dark Gray
-    "background": "#111827",    # Darker
-    "text_primary": "#F9FAFB",  # Light
-    "text_secondary": "#9CA3AF", # Gray
-    "accent": "#06B6D4"         # Cyan
+# --- Load case colors (used in load arrow diagrams) ---
+CASE_COLORS = {
+    "DL": "#E74C3C",   # red
+    "LL": "#2980B9",   # blue
+    "WL": "#27AE60",   # green
+    "SL": "#8E44AD",   # purple
 }
+
+# --- Modern Design System ---
+PALETTES = {
+    "dark": {
+        "primary":        "#2563EB",
+        "secondary":      "#7C3AED",
+        "success":        "#059669",
+        "warning":        "#D97706",
+        "danger":         "#DC2626",
+        "surface":        "#1F2937",
+        "background":     "#111827",
+        "text_primary":   "#F9FAFB",
+        "text_secondary": "#9CA3AF",
+        "accent":         "#06B6D4",
+        "row_alt":        "#374151",
+        "plot_bg":        "#FFFFFF",
+        "plot_text":      "#0F172A",
+        "header_bar":     "#0F172A",
+    },
+    "light": {
+        "primary":        "#1D4ED8",
+        "secondary":      "#6D28D9",
+        "success":        "#047857",
+        "warning":        "#B45309",
+        "danger":         "#B91C1C",
+        "surface":        "#FFFFFF",
+        "background":     "#F1F5F9",
+        "text_primary":   "#0F172A",
+        "text_secondary": "#64748B",
+        "accent":         "#0891B2",
+        "row_alt":        "#E2E8F0",
+        "plot_bg":        "#FFFFFF",
+        "plot_text":      "#111827",
+        "header_bar":     "#1E3A8A",
+    },
+}
+COLOR_PALETTE: dict = dict(PALETTES["dark"])
 
 TYPO_SCALE = {
     "h1": ("Segoe UI", 24, "bold"),
@@ -230,146 +279,105 @@ TYPO_SCALE = {
     "mono": ("Consolas", 11, "normal")
 }
 
-plt.rcParams["font.family"] = "Segoe UI"
+def _apply_mpl_theme(palette: dict) -> None:
+    """Plots always use a light/white background regardless of app theme."""
+    plt.rcParams.update({
+        "font.family":        "Segoe UI",
+        "figure.facecolor":   "#FFFFFF",
+        "axes.facecolor":     "#FFFFFF",
+        "axes.edgecolor":     "#475569",
+        "axes.labelcolor":    "#0F172A",
+        "text.color":         "#0F172A",
+        "xtick.color":        "#334155",
+        "ytick.color":        "#334155",
+        "grid.color":         "#CBD5E1",
+        "grid.alpha":         0.5,
+    })
+
+
+def _force_light_fig(fig) -> None:
+    """Force any matplotlib figure (including anastruct output) to white background."""
+    fig.patch.set_facecolor("#FFFFFF")
+    for ax in fig.get_axes():
+        ax.set_facecolor("#FFFFFF")
+        ax.tick_params(colors="#334155")
+        ax.xaxis.label.set_color("#0F172A")
+        ax.yaxis.label.set_color("#0F172A")
+        ax.title.set_color("#0F172A")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#CBD5E1")
+
+_apply_mpl_theme(COLOR_PALETTE)
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
-# --- Engineering Utilities ---
-def calculate_buckling_stress(L, r, E, Fy):
-    """Calculate critical buckling stress per AISC 360-16"""
-    slenderness_ratio = L / r
-    Fe = (math.pi**2 * E) / (slenderness_ratio**2)  # Elastic buckling stress
-    
-    if slenderness_ratio <= 4.71 * math.sqrt(E / Fy):  # Inelastic buckling
-        Fcr = (0.658**(Fy/Fe)) * Fy
-    else:  # Elastic buckling
-        Fcr = 0.877 * Fe
-    
-    return Fcr, slenderness_ratio
-
-def check_member_stability(force, area, length, profile_data, grade_data):
-    """Comprehensive member stability check"""
-    if abs(force) < 0.001:
-        return {"status": "OK", "utilization": 0.0, "type": "No Load"}
-    
-    stress = abs(force * 1000) / (area * 100)  # Convert kN to N, cm2 to mm2
-    
-    if force > 0:  # Tension
-        allow_stress = grade_data["Fu"]  # Use ultimate strength
-        utilization = stress / allow_stress
-        return {"status": "OK" if utilization <= 1.0 else "FAIL", 
-                "utilization": utilization, "type": "Tension", "stress": stress}
-    else:  # Compression - check buckling
-        r_min = min(profile_data["rx"], profile_data["ry"]) * 10  # Convert cm to mm
-        Fcr, slenderness = calculate_buckling_stress(length*1000, r_min, 
-                                                   grade_data["E"], grade_data["Fy"])
-        utilization = stress / Fcr
-        return {"status": "OK" if utilization <= 1.0 else "FAIL", 
-                "utilization": utilization, "type": "Compression", 
-                "stress": stress, "critical_stress": Fcr, "slenderness": slenderness}
 
 class TrussAnalyzerPro(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("🏗️ Advanced Truss Analyzer PRO v3.0")
-        self.geometry("1800x1000")
+        self._theme = "dark"
+        self.title("Advanced Truss Analyzer PRO v3.0")
+        self.geometry("1800x960")
+        self.minsize(1100, 650)
         self.configure(bg_color=COLOR_PALETTE["background"])
 
-        # Project Data with Enhanced Structure
+        # Delegate structural data and history to TrussModel
+        self.model = TrussModel()
+        self.engine = TrussAnalysisEngine()
         self.ss = None
         self.analysis_results = None
-        self.history_stack = []  # For undo/redo
-        self.history_index = -1
-        
-        self.nodes_data = [
-            {"x": 0.0, "y": 0.0, "support": "Pinned"},
-            {"x": 6.0, "y": 0.0, "support": "Roller"},
-            {"x": 3.0, "y": 4.0, "support": "Free"}
-        ]
-        self.elements_data = [
-            {"node_a": 1, "node_b": 2, "profile": "Box 50x50x2.3"},
-            {"node_a": 2, "node_b": 3, "profile": "Box 50x50x2.3"},
-            {"node_a": 3, "node_b": 1, "profile": "Box 50x50x2.3"}
-        ]
-        self.loads_data = [
-            {"node_id": 3, "fx": 0.0, "fy": -50.0, "case": "LL"},
-            {"node_id": 2, "fx": 0.0, "fy": -25.0, "case": "DL"}
-        ]
-        self.selected_combo = "1.2D + 1.6L"
-        self.design_method = "LRFD"
-        
-        # Parametric Truss Template State
-        self.selected_template = "Warren"
-        self.template_params = {
-            "span": 12.0,
-            "height": 3.0,
-            "bays": 6,
-            "bottom_height": 1.0,  # For Scissors
-            "rise": 2.0,           # For Curved/Bowstring
-            "cantilever_len": 3.0, # For Cantilever
-            "stub_height": 0.5     # For Stub End
-        }
-        
-        self.unit_force = "kN"
-        self.unit_length = "m"
-        self.project_data = {
-            "name": "Advanced Truss Structure", 
-            "engineer": "Structural Engineer", 
-            "date": datetime.datetime.now().strftime("%Y-%m-%d"),
-            "client": "Engineering Firm",
-            "location": "Project Site",
-            "code": "AISC 360-16"
-        }
-        
-        self.setup_ui()
+
+        self.canvas_widgets = []
         self.mini_canvas_widgets = []
+        self.setup_ui()
         self.refresh_ui()
-        
+
         # Save initial state for undo/redo after UI setup
         self.save_state()
-        
+
         # Real-time preview timer
         self.preview_timer = None
         self.auto_preview = True
+
+        # ── Keyboard shortcuts ──────────────────────────────────────────
+        self.bind_all("<Control-z>",      lambda e: self.undo())
+        self.bind_all("<Control-y>",      lambda e: self.redo())
+        self.bind_all("<F5>",             lambda e: self.calculate())
+        self.bind_all("<Control-s>",      lambda e: self.save_project())
+        self.bind_all("<Control-o>",      lambda e: self.load_project())
+        self.bind_all("<Control-p>",      lambda e: self.export_report())
+        self.bind_all("<Control-t>",      lambda e: self.toggle_theme())
+
+    def toggle_theme(self):
+        """Switch between dark and light mode, rebuild UI."""
+        self._theme = "light" if self._theme == "dark" else "dark"
+        COLOR_PALETTE.update(PALETTES[self._theme])
+        ctk.set_appearance_mode(self._theme)
+        _apply_mpl_theme(COLOR_PALETTE)
+
+        # Destroy and rebuild all UI children
+        for w in list(self.winfo_children()):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        self.canvas_widgets = []
+        self.mini_canvas_widgets = []
+        self.configure(bg_color=COLOR_PALETTE["background"])
+        self.setup_ui()
+        self.refresh_ui()
+        if self.ss and self.analysis_results:
+            self.update_enhanced_plots()
     
     def save_state(self):
-        """Save current state for undo/redo"""
-        state = {
-            "nodes": self.nodes_data.copy(),
-            "elements": self.elements_data.copy(),
-            "loads": self.loads_data.copy(),
-            "project": self.project_data.copy()
-        }
-        
-        if self.history_index < len(self.history_stack) - 1:
-            self.history_stack = self.history_stack[:self.history_index + 1]
-        
-        self.history_stack.append(state)
-        if len(self.history_stack) > 50:  # Limit history
-            self.history_stack.pop(0)
-        else:
-            self.history_index += 1
-    
+        self.model.save_state()
+
     def undo(self):
-        """Undo last action"""
-        if self.history_index > 0:
-            self.history_index -= 1
-            state = self.history_stack[self.history_index]
-            self.nodes_data = state["nodes"].copy()
-            self.elements_data = state["elements"].copy()
-            self.loads_data = state["loads"].copy()
-            self.project_data = state["project"].copy()
+        if self.model.undo():
             self.refresh_ui()
-    
+
     def redo(self):
-        """Redo last undone action"""
-        if self.history_index < len(self.history_stack) - 1:
-            self.history_index += 1
-            state = self.history_stack[self.history_index]
-            self.nodes_data = state["nodes"].copy()
-            self.elements_data = state["elements"].copy()
-            self.loads_data = state["loads"].copy()
-            self.project_data = state["project"].copy()
+        if self.model.redo():
             self.refresh_ui()
     
     def schedule_preview_update(self):
@@ -384,109 +392,147 @@ class TrussAnalyzerPro(ctk.CTk):
         """Update only the structure preview without full analysis"""
         if not self.sync_data(show_errors=False):
             return
-        
+
         try:
             # Quick structural preview without full analysis
             temp_ss = SystemElements()
-            for i, el in enumerate(self.elements_data):
-                if el["node_a"] > len(self.nodes_data) or el["node_b"] > len(self.nodes_data):
+            for i, el in enumerate(self.model.elements_data):
+                if el["node_a"] > len(self.model.nodes_data) or el["node_b"] > len(self.model.nodes_data):
                     continue
-                n1, n2 = self.nodes_data[el["node_a"]-1], self.nodes_data[el["node_b"]-1]
+                n1, n2 = self.model.nodes_data[el["node_a"]-1], self.model.nodes_data[el["node_b"]-1]
                 temp_ss.add_truss_element(location=[[n1["x"], n1["y"]], [n2["x"], n2["y"]]], EA=1000)
-            
-            for i, n in enumerate(self.nodes_data):
+
+            for i, n in enumerate(self.model.nodes_data):
                 if n["support"] == "Pinned": temp_ss.add_support_hinged(node_id=i+1)
                 elif n["support"] == "Roller": temp_ss.add_support_roll(node_id=i+1, direction=2)
-            
-            # Update preview visualization
+
+            # Update preview visualization (custom per-case arrows drawn inside)
             self.update_structure_preview(temp_ss)
-        except:
+        except Exception:
             pass
 
     def setup_ui(self):
-        self.grid_columnconfigure(0, weight=1, minsize=600)
-        self.grid_columnconfigure(1, weight=3)
+        # ── Responsive grid: left panel fixed-ish, right panel expands ──
+        self.grid_columnconfigure(0, weight=0, minsize=420)
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0)   # bottom status bar
 
-        # Modern Left Panel with Enhanced Styling
-        self.left_panel = ctk.CTkFrame(self, fg_color=COLOR_PALETTE["surface"], corner_radius=15)
-        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
-        
-        # Enhanced Header
-        header = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        header.pack(fill="x", padx=15, pady=(15, 10))
-        
-        title_label = ctk.CTkLabel(header, text="🏗️ Advanced Truss Designer", 
-                                   font=TYPO_SCALE["h2"], text_color=COLOR_PALETTE["text_primary"])
-        title_label.pack()
-        
-        # Undo/Redo Controls
-        undo_frame = ctk.CTkFrame(header, fg_color="transparent")
-        undo_frame.pack(fill="x", pady=(10, 0))
-        
-        ctk.CTkButton(undo_frame, text="⎌ Undo", width=80, height=32, 
-                      fg_color=COLOR_PALETTE["secondary"], command=self.undo).pack(side="left", padx=5)
-        ctk.CTkButton(undo_frame, text="⎋ Redo", width=80, height=32,
-                      fg_color=COLOR_PALETTE["secondary"], command=self.redo).pack(side="left", padx=5)
-        
-        # Auto-preview toggle
+        # ── Left Panel ───────────────────────────────────────────────────
+        self.left_panel = ctk.CTkFrame(self, fg_color=COLOR_PALETTE["surface"], corner_radius=12)
+        self.left_panel.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(12, 6), pady=12)
+
+        # Header row: title + theme toggle
+        hdr = ctk.CTkFrame(self.left_panel, fg_color=COLOR_PALETTE["header_bar"], corner_radius=8)
+        hdr.pack(fill="x", padx=8, pady=(8, 4))
+
+        ctk.CTkLabel(hdr, text="Advanced Truss Designer",
+                     font=TYPO_SCALE["h3"],
+                     text_color="#FFFFFF").pack(side="left", padx=12, pady=8)
+
+        # Theme toggle button (right side of header)
+        theme_icon = "☀" if self._theme == "dark" else "☾"
+        theme_tip  = "Light mode (Ctrl+T)" if self._theme == "dark" else "Dark mode (Ctrl+T)"
+        self._theme_btn = ctk.CTkButton(
+            hdr, text=f"{theme_icon}  {'Light' if self._theme == 'dark' else 'Dark'}",
+            width=90, height=28, corner_radius=6,
+            fg_color=COLOR_PALETTE["primary"],
+            hover_color=COLOR_PALETTE["accent"],
+            font=TYPO_SCALE["small"],
+            command=self.toggle_theme,
+        )
+        self._theme_btn.pack(side="right", padx=8, pady=6)
+
+        # Undo / Redo / Auto-preview row
+        undo_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        undo_frame.pack(fill="x", padx=8, pady=(4, 0))
+
+        ctk.CTkButton(undo_frame, text="Undo (Ctrl+Z)", width=110, height=28,
+                      fg_color=COLOR_PALETTE["secondary"],
+                      font=TYPO_SCALE["small"],
+                      command=self.undo).pack(side="left", padx=3)
+        ctk.CTkButton(undo_frame, text="Redo (Ctrl+Y)", width=110, height=28,
+                      fg_color=COLOR_PALETTE["secondary"],
+                      font=TYPO_SCALE["small"],
+                      command=self.redo).pack(side="left", padx=3)
+
         self.auto_preview_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(undo_frame, text="Auto Preview", variable=self.auto_preview_var,
-                        command=self.toggle_auto_preview).pack(side="right", padx=5)
-        
-        self.tabs = ctk.CTkTabview(self.left_panel, fg_color=COLOR_PALETTE["surface"])
-        self.tabs.pack(fill="both", expand=True, padx=10, pady=5)
+        ctk.CTkCheckBox(undo_frame, text="Auto Preview",
+                        variable=self.auto_preview_var,
+                        font=TYPO_SCALE["small"],
+                        command=self.toggle_auto_preview).pack(side="right", padx=6)
 
-        self.tab_proj = self.tabs.add("📋 Project")
-        self.tab_nodes = self.tabs.add("📍 Nodes")
-        self.tab_elems = self.tabs.add("🔗 Members")
-        self.tab_loads = self.tabs.add("⚡ Loads")
-        self.tab_combo = self.tabs.add("🧮 Combinations")
-        self.tab_templ = self.tabs.add("🏗️ Templates")
-        self.tab_res   = self.tabs.add("📊 Results")
-    
+        # Tab view
+        self.tabs = ctk.CTkTabview(self.left_panel, fg_color=COLOR_PALETTE["surface"])
+        self.tabs.pack(fill="both", expand=True, padx=6, pady=4)
+
+        self.tab_proj  = self.tabs.add("Project")
+        self.tab_nodes = self.tabs.add("Nodes")
+        self.tab_elems = self.tabs.add("Members")
+        self.tab_loads = self.tabs.add("Loads")
+        self.tab_combo = self.tabs.add("Combos")
+        self.tab_templ = self.tabs.add("Templates")
+        self.tab_res   = self.tabs.add("Results")
+
+        # Action buttons
+        ctrl = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        ctrl.pack(fill="x", padx=8, pady=8)
+
+        ctk.CTkButton(ctrl, text="ANALYZE  (F5)",
+                      height=44, corner_radius=8,
+                      fg_color=COLOR_PALETTE["success"],
+                      hover_color="#065F46",
+                      font=TYPO_SCALE["h3"],
+                      command=self.calculate).pack(fill="x", pady=(0, 6))
+
+        btn_row1 = ctk.CTkFrame(ctrl, fg_color="transparent")
+        btn_row1.pack(fill="x", pady=2)
+        ctk.CTkButton(btn_row1, text="Save (Ctrl+S)", height=32, corner_radius=6,
+                      fg_color=COLOR_PALETTE["primary"],
+                      font=TYPO_SCALE["small"],
+                      command=self.save_project).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ctk.CTkButton(btn_row1, text="Load (Ctrl+O)", height=32, corner_radius=6,
+                      fg_color=COLOR_PALETTE["primary"],
+                      font=TYPO_SCALE["small"],
+                      command=self.load_project).pack(side="left", expand=True, fill="x", padx=(3, 0))
+
+        btn_row2 = ctk.CTkFrame(ctrl, fg_color="transparent")
+        btn_row2.pack(fill="x", pady=2)
+        ctk.CTkButton(btn_row2, text="CSV Export", height=32, corner_radius=6,
+                      fg_color=COLOR_PALETTE["warning"],
+                      font=TYPO_SCALE["small"],
+                      command=self.export_csv).pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ctk.CTkButton(btn_row2, text="PDF Report (Ctrl+P)", height=32, corner_radius=6,
+                      fg_color=COLOR_PALETTE["danger"],
+                      font=TYPO_SCALE["small"],
+                      command=self.export_report).pack(side="left", expand=True, fill="x", padx=(3, 0))
+
+        # ── Right Panel (plots) ─────────────────────────────────────��────
+        self.right_panel = ctk.CTkScrollableFrame(
+            self, fg_color=COLOR_PALETTE["background"], corner_radius=12)
+        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 12), pady=(12, 0))
+
+        # Status bar (full width, bottom)
+        self.status_frame = ctk.CTkFrame(
+            self, height=32, fg_color=COLOR_PALETTE["header_bar"], corner_radius=0)
+        self.status_frame.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(4, 12))
+        self.status_frame.grid_columnconfigure(0, weight=1)
+        self.status_frame.grid_columnconfigure(1, weight=0)
+
+        self.status_label = ctk.CTkLabel(
+            self.status_frame, text="Ready  |  F5 = Analyze   Ctrl+Z/Y = Undo/Redo   Ctrl+T = Theme",
+            font=TYPO_SCALE["small"], text_color=COLOR_PALETTE["text_secondary"])
+        self.status_label.grid(row=0, column=0, padx=12, pady=4, sticky="w")
+
+        # Keyboard shortcut hint (right side of status bar)
+        ctk.CTkLabel(self.status_frame,
+                     text=f"{'Dark' if self._theme == 'dark' else 'Light'} mode",
+                     font=TYPO_SCALE["small"],
+                     text_color=COLOR_PALETTE["accent"]).grid(
+                     row=0, column=1, padx=12, pady=4, sticky="e")
+
     def toggle_auto_preview(self):
         self.auto_preview = self.auto_preview_var.get()
-
-        # Enhanced Action Controls
-        ctrl = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        ctrl.pack(fill="x", padx=15, pady=15)
-        
-        # Main analyze button
-        analyze_btn = ctk.CTkButton(ctrl, text="🚀 FULL ANALYSIS & DESIGN CHECK", 
-                                    height=50, fg_color=COLOR_PALETTE["success"],
-                                    font=TYPO_SCALE["h3"], command=self.calculate)
-        analyze_btn.pack(fill="x", pady=(0, 10))
-        
-        # File operations
-        file_frame = ctk.CTkFrame(ctrl, fg_color="transparent")
-        file_frame.pack(fill="x", pady=5)
-        
-        ctk.CTkButton(file_frame, text="💾 Save", width=90, height=35,
-                      fg_color=COLOR_PALETTE["primary"], command=self.save_project).pack(side="left", padx=3)
-        ctk.CTkButton(file_frame, text="📂 Load", width=90, height=35,
-                      fg_color=COLOR_PALETTE["primary"], command=self.load_project).pack(side="left", padx=3)
-        
-        # Export operations
-        export_frame = ctk.CTkFrame(ctrl, fg_color="transparent")
-        export_frame.pack(fill="x", pady=5)
-        
-        ctk.CTkButton(export_frame, text="📊 CSV Export", width=130, height=35,
-                      fg_color=COLOR_PALETTE["warning"], command=self.export_csv).pack(side="left", padx=3)
-        ctk.CTkButton(export_frame, text="📄 PDF Report", width=130, height=35,
-                      fg_color=COLOR_PALETTE["danger"], command=self.export_report).pack(side="right", padx=3)
-
-        # Enhanced Right Panel with Modern Styling
-        self.right_panel = ctk.CTkScrollableFrame(self, fg_color=COLOR_PALETTE["background"], corner_radius=15)
-        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 15), pady=15)
-        self.canvas_widgets = []
-        
-        # Status Bar
-        self.status_frame = ctk.CTkFrame(self.right_panel, height=40, fg_color=COLOR_PALETTE["surface"])
-        self.status_frame.pack(fill="x", padx=10, pady=(10, 5))
-        self.status_label = ctk.CTkLabel(self.status_frame, text="✓ Ready for Analysis", 
-                                         font=TYPO_SCALE["body"], text_color=COLOR_PALETTE["success"])
-        self.status_label.pack(pady=10)
 
     def refresh_ui(self):
         self.draw_nodes_tab()
@@ -540,7 +586,7 @@ class TrussAnalyzerPro(ctk.CTk):
                         raise ValueError(f"Load #{i+1}: Invalid node N{node_id} (Max N{len(new_nodes)})")
                     
                     if abs(fx) > 10000 or abs(fy) > 10000:
-                        raise ValueError(f"Load #{i+1}: Unrealistic load magnitude (>10,000 kN)")
+                        raise ValueError(f"Load #{i+1}: Unrealistic load magnitude (>10,000 kN). Input must be in kN.")
                         
                     new_loads.append({"node_id": node_id, "fx": fx, "fy": fy, "case": e["case"].get()})
                 except ValueError as ve:
@@ -555,17 +601,24 @@ class TrussAnalyzerPro(ctk.CTk):
             if len(new_elems) < 1:
                 raise ValueError("Minimum 1 member required for analysis")
             
-            # Check for duplicate nodes (within 1mm tolerance)
-            for i in range(len(new_nodes)):
-                for j in range(i+1, len(new_nodes)):
-                    dx = abs(new_nodes[i]["x"] - new_nodes[j]["x"])
-                    dy = abs(new_nodes[i]["y"] - new_nodes[j]["y"])
-                    if dx < 0.001 and dy < 0.001:
-                        raise ValueError(f"Nodes N{i+1} and N{j+1} are coincident (same location)")
+            # Check for zero-length elements (coincident endpoint nodes)
+            # Note: coincident *nodes* are allowed — anastruct merges them automatically.
+            # Only reject elements whose two endpoints are at exactly the same position.
+            import math as _math
+            for k, el in enumerate(new_elems):
+                na, nb = el["node_a"] - 1, el["node_b"] - 1
+                if 0 <= na < len(new_nodes) and 0 <= nb < len(new_nodes):
+                    n1, n2 = new_nodes[na], new_nodes[nb]
+                    dist = _math.sqrt((n1["x"]-n2["x"])**2 + (n1["y"]-n2["y"])**2)
+                    if dist < 1e-6:
+                        raise ValueError(
+                            f"Member E{k+1} (N{el['node_a']}–N{el['node_b']}) "
+                            f"has zero length — the two nodes are at the same location"
+                        )
 
-            self.nodes_data = new_nodes
-            self.elements_data = new_elems
-            self.loads_data = new_loads
+            self.model.nodes_data = new_nodes
+            self.model.elements_data = new_elems
+            self.model.loads_data = new_loads
             
             self.update_status("✓ Data validated successfully", "success")
             return True
@@ -591,7 +644,10 @@ class TrussAnalyzerPro(ctk.CTk):
         self.status_label.configure(text=message, text_color=color_map.get(status_type, color_map["info"]))
 
     def draw_nodes_tab(self):
-        for w in self.tab_nodes.winfo_children(): w.destroy()
+        self.update_idletasks()
+        for w in self.tab_nodes.winfo_children():
+            try: w.destroy()
+            except Exception: pass
         
         # Header with instructions
         header = ctk.CTkFrame(self.tab_nodes, fg_color="transparent")
@@ -613,7 +669,7 @@ class TrussAnalyzerPro(ctk.CTk):
         scroll.pack(fill="both", expand=True, padx=10)
         
         self.node_entries = []
-        for i, n in enumerate(self.nodes_data):
+        for i, n in enumerate(self.model.nodes_data):
             row = ctk.CTkFrame(scroll, fg_color=COLOR_PALETTE["surface"])
             row.pack(fill="x", pady=3)
             
@@ -648,7 +704,10 @@ class TrussAnalyzerPro(ctk.CTk):
                       fg_color=COLOR_PALETTE["success"], command=self.add_node_with_save).pack()
 
     def draw_elements_tab(self):
-        for w in self.tab_elems.winfo_children(): w.destroy()
+        self.update_idletasks()
+        for w in self.tab_elems.winfo_children():
+            try: w.destroy()
+            except Exception: pass
         
         # Header
         header = ctk.CTkFrame(self.tab_elems, fg_color="transparent")
@@ -671,7 +730,7 @@ class TrussAnalyzerPro(ctk.CTk):
         scroll.pack(fill="both", expand=True, padx=10)
         
         self.elem_entries = []
-        for i, el in enumerate(self.elements_data):
+        for i, el in enumerate(self.model.elements_data):
             row = ctk.CTkFrame(scroll, fg_color=COLOR_PALETTE["surface"])
             row.pack(fill="x", pady=3)
             
@@ -718,16 +777,20 @@ class TrussAnalyzerPro(ctk.CTk):
                       fg_color=COLOR_PALETTE["success"], command=self.add_member_with_save).pack()
 
     def draw_loads_tab(self):
-        for w in self.tab_loads.winfo_children(): w.destroy()
+        self.update_idletasks()
+        for w in self.tab_loads.winfo_children():
+            try: w.destroy()
+            except Exception: pass
         
         # Header
         header = ctk.CTkFrame(self.tab_loads, fg_color="transparent")
         header.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(header, text="Applied Loads & Load Cases", 
                      font=TYPO_SCALE["h3"], text_color=COLOR_PALETTE["text_primary"]).pack()
-        ctk.CTkLabel(header, text="Forces in kN: Fx (horizontal), Fy (vertical, -ve = downward)", 
+        ctk.CTkLabel(header,
+                     text="Input unit: kN  |  Fx = horizontal, Fy = vertical (-ve = downward)",
                      font=TYPO_SCALE["small"], text_color=COLOR_PALETTE["text_secondary"]).pack()
-        
+
         # Column headers
         header_row = ctk.CTkFrame(self.tab_loads, fg_color=COLOR_PALETTE["secondary"])
         header_row.pack(fill="x", padx=10, pady=5)
@@ -740,7 +803,7 @@ class TrussAnalyzerPro(ctk.CTk):
         scroll.pack(fill="both", expand=True, padx=10)
         
         self.load_entries = []
-        for i, ld in enumerate(self.loads_data):
+        for i, ld in enumerate(self.model.loads_data):
             row = ctk.CTkFrame(scroll, fg_color=COLOR_PALETTE["surface"])
             row.pack(fill="x", pady=3)
             
@@ -782,7 +845,10 @@ class TrussAnalyzerPro(ctk.CTk):
     
     def draw_combo_tab(self):
         """Load Combinations Tab"""
-        for w in self.tab_combo.winfo_children(): w.destroy()
+        self.update_idletasks()
+        for w in self.tab_combo.winfo_children():
+            try: w.destroy()
+            except Exception: pass
         
         # Header
         header = ctk.CTkFrame(self.tab_combo, fg_color="transparent")
@@ -796,7 +862,7 @@ class TrussAnalyzerPro(ctk.CTk):
         
         ctk.CTkLabel(method_frame, text="Design Method:", font=TYPO_SCALE["body"]).pack(side="left", padx=10)
         
-        self.method_var = ctk.StringVar(value=self.design_method)
+        self.method_var = ctk.StringVar(value=self.model.design_method)
         method_radio_frame = ctk.CTkFrame(method_frame, fg_color="transparent")
         method_radio_frame.pack(side="left", padx=20)
         
@@ -807,48 +873,139 @@ class TrussAnalyzerPro(ctk.CTk):
         
         # Combination selection
         combo_frame = ctk.CTkFrame(self.tab_combo, fg_color="transparent")
-        combo_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
+        combo_frame.pack(fill="both", expand=True, padx=10, pady=(5, 0))
+
         ctk.CTkLabel(combo_frame, text="Select Load Combination:", font=TYPO_SCALE["body"]).pack(anchor="w", pady=5)
-        
-        self.combo_var = ctk.StringVar(value=self.selected_combo)
-        self.combo_listbox = ctk.CTkScrollableFrame(combo_frame, height=200)
+
+        self.combo_var = ctk.StringVar(value=self.model.selected_combo)
+        self.combo_listbox = ctk.CTkScrollableFrame(combo_frame, height=180)
         self.combo_listbox.pack(fill="both", expand=True)
-        
+
+        # ── Add Custom Combination ────────────────────────────────────────────
+        add_frame = ctk.CTkFrame(self.tab_combo, fg_color=COLOR_PALETTE["surface"])
+        add_frame.pack(fill="x", padx=10, pady=(6, 10))
+
+        ctk.CTkLabel(add_frame, text="➕ Add Custom Combination",
+                     font=TYPO_SCALE["body"]).pack(anchor="w", padx=10, pady=(8, 4))
+
+        name_row = ctk.CTkFrame(add_frame, fg_color="transparent")
+        name_row.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(name_row, text="Name:", width=50).pack(side="left")
+        self._custom_name_var = ctk.StringVar()
+        ctk.CTkEntry(name_row, textvariable=self._custom_name_var,
+                     placeholder_text="e.g. 1.35D + 1.5L", width=260).pack(side="left", padx=(4, 0))
+
+        factor_row = ctk.CTkFrame(add_frame, fg_color="transparent")
+        factor_row.pack(fill="x", padx=10, pady=2)
+        self._custom_factors: dict[str, ctk.StringVar] = {}
+        for case in ("DL", "LL", "WL", "SL"):
+            ctk.CTkLabel(factor_row, text=f"{case}:", width=28).pack(side="left")
+            sv = ctk.StringVar(value="0.0")
+            ctk.CTkEntry(factor_row, textvariable=sv, width=56).pack(side="left", padx=(2, 8))
+            self._custom_factors[case] = sv
+
+        ctk.CTkButton(add_frame, text="Add", width=80,
+                      command=self._add_custom_combination).pack(anchor="e", padx=10, pady=(4, 8))
+
         self.update_combinations()
     
     def update_combinations(self):
-        """Update available load combinations based on selected method"""
-        for w in self.combo_listbox.winfo_children(): w.destroy()
-        
+        """Update available load combinations based on selected method."""
+        self.update_idletasks()
+        for w in self.combo_listbox.winfo_children():
+            try: w.destroy()
+            except Exception: pass
+
         method = self.method_var.get()
-        self.design_method = method
-        combinations = LOAD_COMBINATIONS[method]
-        
-        for combo_name, factors in combinations.items():
-            combo_frame = ctk.CTkFrame(self.combo_listbox, fg_color=COLOR_PALETTE["surface"])
-            combo_frame.pack(fill="x", pady=2)
-            
-            radio = ctk.CTkRadioButton(combo_frame, text=combo_name, variable=self.combo_var, value=combo_name)
+        self.model.design_method = method
+
+        # Merge built-in + custom for this method
+        all_combos: dict = {**LOAD_COMBINATIONS[method],
+                            **self.model.custom_combinations.get(method, {})}
+
+        # Reset selection if current value doesn't belong to the new method
+        if self.combo_var.get() not in all_combos:
+            first_combo = next(iter(all_combos))
+            self.combo_var.set(first_combo)
+            self.model.selected_combo = first_combo
+
+        custom_names = set(self.model.custom_combinations.get(method, {}).keys())
+
+        for combo_name, factors in all_combos.items():
+            is_custom = combo_name in custom_names
+            row = ctk.CTkFrame(self.combo_listbox,
+                               fg_color=COLOR_PALETTE["surface"] if not is_custom else "#1e3a2f")
+            row.pack(fill="x", pady=2)
+
+            radio = ctk.CTkRadioButton(row, text=combo_name, variable=self.combo_var,
+                                       value=combo_name,
+                                       command=lambda v=combo_name: setattr(self.model, "selected_combo", v))
             radio.pack(side="left", padx=10)
-            
+
             factors_text = " | ".join([f"{k}:{v}" for k, v in factors.items() if v != 0])
-            ctk.CTkLabel(combo_frame, text=factors_text, font=TYPO_SCALE["small"], 
-                        text_color=COLOR_PALETTE["text_secondary"]).pack(side="right", padx=10)
+            ctk.CTkLabel(row, text=factors_text, font=TYPO_SCALE["small"],
+                         text_color=COLOR_PALETTE["text_secondary"]).pack(side="left", padx=6)
+
+            if is_custom:
+                ctk.CTkButton(row, text="✕", width=28, height=22, fg_color="#c0392b",
+                              command=lambda n=combo_name: self._delete_custom_combination(n)
+                              ).pack(side="right", padx=6)
+
+    def _add_custom_combination(self):
+        """Validate inputs and add a new custom combination."""
+        name = self._custom_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Custom Combination", "Please enter a combination name.")
+            return
+
+        method = self.method_var.get()
+        all_combos = {**LOAD_COMBINATIONS[method], **self.model.custom_combinations.get(method, {})}
+        if name in all_combos:
+            messagebox.showwarning("Custom Combination", f'"{name}" already exists.')
+            return
+
+        try:
+            factors = {case: float(sv.get()) for case, sv in self._custom_factors.items()}
+        except ValueError:
+            messagebox.showerror("Custom Combination", "Factors must be numbers.")
+            return
+
+        if all(v == 0.0 for v in factors.values()):
+            messagebox.showwarning("Custom Combination", "At least one factor must be non-zero.")
+            return
+
+        self.model.custom_combinations.setdefault(method, {})[name] = factors
+        self._custom_name_var.set("")
+        for sv in self._custom_factors.values():
+            sv.set("0.0")
+        self.update_combinations()
+        # Auto-select the newly added combo
+        self.combo_var.set(name)
+        self.model.selected_combo = name
+
+    def _delete_custom_combination(self, name: str):
+        """Remove a custom combination and reset selection if it was active."""
+        method = self.method_var.get()
+        self.model.custom_combinations.get(method, {}).pop(name, None)
+        if self.model.selected_combo == name:
+            first = next(iter(LOAD_COMBINATIONS[method]))
+            self.combo_var.set(first)
+            self.model.selected_combo = first
+        self.update_combinations()
 
     # Enhanced add/delete with state saving
     def add_node_with_save(self): 
         if self.sync_data(): 
-            self.nodes_data.append({"x": 0, "y": 0, "support": "Free"})
+            self.model.nodes_data.append({"x": 0, "y": 0, "support": "Free"})
             self.save_state()
             self.refresh_ui()
             self.schedule_preview_update()
     
     def add_member_with_save(self): 
         if self.sync_data(): 
-            max_node = len(self.nodes_data)
+            max_node = len(self.model.nodes_data)
             if max_node >= 2:
-                self.elements_data.append({"node_a": 1, "node_b": min(2, max_node), "profile": "Box 50x50x2.3"})
+                self.model.elements_data.append({"node_a": 1, "node_b": min(2, max_node), "profile": "Box 50x50x2.3"})
                 self.save_state()
                 self.refresh_ui()
                 self.schedule_preview_update()
@@ -857,8 +1014,8 @@ class TrussAnalyzerPro(ctk.CTk):
     
     def add_load_with_save(self): 
         if self.sync_data(): 
-            if self.nodes_data:
-                self.loads_data.append({"node_id": 1, "fx": 0, "fy": -10, "case": "LL"})
+            if self.model.nodes_data:
+                self.model.loads_data.append({"node_id": 1, "fx": 0, "fy": -10, "case": "LL"})
                 self.save_state()
                 self.refresh_ui()
             else:
@@ -866,128 +1023,76 @@ class TrussAnalyzerPro(ctk.CTk):
     
     def delete_row_with_save(self, row_type, idx):
         if self.sync_data():
-            if row_type == "node" and len(self.nodes_data) <= 2:
+            if row_type == "node" and len(self.model.nodes_data) <= 2:
                 messagebox.showwarning("Warning", "Cannot delete - minimum 2 nodes required")
                 return
-            elif row_type == "elem" and len(self.elements_data) <= 1:
+            elif row_type == "elem" and len(self.model.elements_data) <= 1:
                 messagebox.showwarning("Warning", "Cannot delete - minimum 1 member required")
                 return
                 
-            if row_type == "node": self.nodes_data.pop(idx)
-            elif row_type == "elem": self.elements_data.pop(idx)
-            elif row_type == "load": self.loads_data.pop(idx)
+            if row_type == "node": self.model.nodes_data.pop(idx)
+            elif row_type == "elem": self.model.elements_data.pop(idx)
+            elif row_type == "load": self.model.loads_data.pop(idx)
             
             self.save_state()
             self.refresh_ui()
             self.schedule_preview_update()
 
     def calculate(self):
-        """Enhanced analysis with proper load combinations and member checks"""
-        if not self.sync_data(): return
-        if not self.elements_data: 
-            messagebox.showwarning("⚠️ Analysis Error", "No members to analyze!"); return
-        
-        # Enhanced stability check
-        nj, nm = len(self.nodes_data), len(self.elements_data)
-        nr = sum([2 if n["support"]=="Pinned" else (1 if n["support"]=="Roller" else 0) for n in self.nodes_data])
-        
+        if not self.sync_data():
+            return
+        if not self.model.elements_data:
+            messagebox.showwarning("⚠️ Analysis Error", "No members to analyze!")
+            return
+
+        unique_coords = {(round(n["x"], 6), round(n["y"], 6)) for n in self.model.nodes_data}
+        nj = len(unique_coords)
+        nm = len(self.model.elements_data)
+        nr = sum(
+            2 if n["support"] == "Pinned" else (1 if n["support"] == "Roller" else 0)
+            for n in self.model.nodes_data
+        )
         if (nm + nr) < (2 * nj):
-            messagebox.showwarning("🔧 Stability Alert", 
-                f"Structure may be unstable!\n{nm} Members + {nr} Reactions < 2 × {nj} Nodes\n\nRecommend adding members or supports.")
+            messagebox.showwarning(
+                "Stability Alert",
+                f"Structure may be unstable!\n{nm} Members + {nr} Reactions < 2x{nj} Nodes\n\nRecommend adding members or supports."
+            )
         elif (nm + nr) > (2 * nj):
-            messagebox.showinfo("📊 Stability Info", 
-                f"Structure is statically indeterminate.\n{nm} Members + {nr} Reactions > 2 × {nj} Nodes")
+            self.update_status(
+                f"Statically indeterminate: {nm}m + {nr}r > 2x{nj}j", "info"
+            )
 
         try:
             self.update_status("🔄 Running structural analysis...", "info")
-            
-            # Get selected load combination
-            self.selected_combo = self.combo_var.get()
-            combo_factors = LOAD_COMBINATIONS[self.design_method][self.selected_combo]
-            
-            self.ss = SystemElements()
-            
-            # Add elements with correct EA values
-            for i, el in enumerate(self.elements_data):
-                if el["node_a"] > nj or el["node_b"] > nj or el["node_a"] < 1 or el["node_b"] < 1:
-                    raise ValueError(f"Member E{i+1} references non-existent Node (Max N{nj})")
-                    
-                profile = STEEL_PROFILES[el["profile"]]
-                steel_grade = STEEL_GRADES[profile["Grade"]]
-                
-                # Correct EA calculation: E(MPa) × Area(cm²) × 10 = EA(kN)
-                ea_val = steel_grade["E"] * profile["Area"] * 10
-                
-                n1, n2 = self.nodes_data[el["node_a"]-1], self.nodes_data[el["node_b"]-1]
-                self.ss.add_truss_element(location=[[n1["x"], n1["y"]], [n2["x"], n2["y"]]], EA=ea_val)
-            
-            # Add supports
-            for i, n in enumerate(self.nodes_data):
-                if n["support"] == "Pinned": self.ss.add_support_hinged(node_id=i+1)
-                elif n["support"] == "Roller": self.ss.add_support_roll(node_id=i+1, direction=2)
+            self.model.selected_combo = self.combo_var.get()
 
-            # Apply loads with combination factors
-            for i, ld in enumerate(self.loads_data):
-                if ld["node_id"] > nj or ld["node_id"] < 1:
-                    raise ValueError(f"Load #{i+1} references non-existent Node N{ld['node_id']}")
-                
-                load_case = ld["case"]
-                factor = combo_factors.get(load_case, 0.0)
-                
-                if factor != 0.0:
-                    self.ss.point_load(node_id=ld["node_id"], 
-                                     Fx=ld["fx"] * factor, 
-                                     Fy=ld["fy"] * factor)
-
-            self.ss.solve()
-            self.analysis_results = self.perform_member_checks()
-            
+            # Merge built-in + custom combinations before passing to engine
+            merged_combos = {
+                method: {**LOAD_COMBINATIONS[method],
+                         **self.model.custom_combinations.get(method, {})}
+                for method in LOAD_COMBINATIONS
+            }
+            self.ss = self.engine.build_and_solve(
+                self.model, SystemElements, STEEL_GRADES, STEEL_PROFILES, merged_combos
+            )
+            self.analysis_results = self.engine.member_checks(
+                self.model, self.ss, STEEL_GRADES, STEEL_PROFILES
+            )
             self.update_enhanced_plots()
             self.show_enhanced_results()
-            
-            self.update_status(f"✅ Analysis complete using {self.selected_combo}", "success")
-            
+            self.update_status(f"✅ Analysis complete — {self.model.selected_combo}", "success")
+
         except Exception as e:
-            error_msg = f"Analysis failed: {str(e)}"
-            messagebox.showerror("❌ Analysis Error", error_msg)
-            self.update_status(f"❌ {error_msg}", "error")
-    
-    def perform_member_checks(self):
-        """Perform comprehensive member design checks"""
-        if not self.ss: return []
-        
-        results = []
-        
-        for i, el_data in enumerate(self.elements_data):
-            elem_id = i + 1  # Element IDs are 1-indexed
-            el_result = self.ss.get_element_results(element_id=elem_id)
-            profile = STEEL_PROFILES[el_data["profile"]]
-            grade = STEEL_GRADES[profile["Grade"]]
-            
-            # Calculate member length
-            n1, n2 = self.nodes_data[el_data["node_a"]-1], self.nodes_data[el_data["node_b"]-1]
-            length = math.sqrt((n2["x"] - n1["x"])**2 + (n2["y"] - n1["y"])**2)
-            
-            # Force from analysis
-            force = el_result["Nmin"]
-            
-            # Perform member check
-            check_result = check_member_stability(force, profile["Area"], length, profile, grade)
-            check_result["member_id"] = f"E{i+1}"
-            check_result["profile"] = el_data["profile"]
-            check_result["force"] = force
-            check_result["length"] = length
-            
-            results.append(check_result)
-        
-        return results
+            msg = f"Analysis failed: {e}"
+            messagebox.showerror("❌ Analysis Error", msg)
+            self.update_status(f"❌ {msg}", "error")
 
     def _rescale_graph_labels(self, fig, diagram_type):
         """Convert anastruct graph text labels to user-selected units."""
         import re
 
-        ff = UNIT_FORCE_TO_KN[self.unit_force]
-        lf = UNIT_LENGTH_TO_M[self.unit_length]
+        ff = UNIT_FORCE_TO_KN[self.model.unit_force]
+        lf = UNIT_LENGTH_TO_M[self.model.unit_length]
         
         ax = fig.gca()
         for text in ax.texts:
@@ -1009,13 +1114,13 @@ class TrussAnalyzerPro(ctk.CTk):
 
     def add_dimensions(self, fig):
         """Add overall span and height dimensions to the truss plot."""
-        if not self.nodes_data:
+        if not self.model.nodes_data:
             return
         import numpy as np
 
         ax = fig.gca()
-        xs = [n["x"] for n in self.nodes_data]
-        ys = [n["y"] for n in self.nodes_data]
+        xs = [n["x"] for n in self.model.nodes_data]
+        ys = [n["y"] for n in self.model.nodes_data]
         
         xmin, xmax = min(xs), max(xs)
         ymin, ymax = min(ys), max(ys)
@@ -1031,14 +1136,14 @@ class TrussAnalyzerPro(ctk.CTk):
         y_dim = cur_ymin - y_range * 0.15
         ax.annotate("", xy=(xmin, y_dim), xytext=(xmax, y_dim),
                     arrowprops=dict(arrowstyle="<|-|>", color="gray", lw=1.5))
-        ax.text((xmin + xmax)/2, y_dim + y_range * 0.03, f"Span: {width:.2f} {self.unit_length}",
+        ax.text((xmin + xmax)/2, y_dim + y_range * 0.03, f"Span: {width:.2f} {self.model.unit_length}",
                 ha="center", va="bottom", fontsize=10, color="darkblue", fontweight="bold")
         
         # 2. Vertical Height Dimension (Left)
         x_dim = xmin - (xmax - xmin) * 0.1
         ax.annotate("", xy=(x_dim, ymin), xytext=(x_dim, ymax),
                     arrowprops=dict(arrowstyle="<|-|>", color="gray", lw=1.5))
-        ax.text(x_dim - (xmax - xmin) * 0.02, (ymin + ymax)/2, f"H: {height:.2f} {self.unit_length}",
+        ax.text(x_dim - (xmax - xmin) * 0.02, (ymin + ymax)/2, f"H: {height:.2f} {self.model.unit_length}",
                 ha="right", va="center", rotation=90, fontsize=10, color="darkblue", fontweight="bold")
 
         # Adjust limits to fit dimensions
@@ -1058,85 +1163,362 @@ class TrussAnalyzerPro(ctk.CTk):
             except Exception:
                 pass
 
+    def _compute_bom(self) -> list[dict]:
+        """
+        Bill of Materials: group members by (category, profile).
+        Categories: Top Chord, Bottom Chord, Vertical, Diagonal.
+        Returns list of row-dicts with keys:
+          category, profile, count, total_length, kg_per_m, total_weight
+        """
+        nodes = self.model.nodes_data
+        elems = self.model.elements_data
+        if not nodes or not elems:
+            return []
+
+        ymin = min(n["y"] for n in nodes)
+        tol  = max((max(n["y"] for n in nodes) - ymin) * 0.05, 1e-6)
+
+        def is_bottom(n):
+            return n["y"] <= ymin + tol
+
+        groups: dict = {}  # (category, profile) -> accumulator
+        for el in elems:
+            na = nodes[el["node_a"] - 1]
+            nb = nodes[el["node_b"] - 1]
+            dx = abs(nb["x"] - na["x"])
+            dy = abs(nb["y"] - na["y"])
+            length = math.sqrt(dx ** 2 + dy ** 2)
+            profile = el["profile"]
+
+            if is_bottom(na) and is_bottom(nb):
+                cat = "Bottom Chord"
+            elif not is_bottom(na) and not is_bottom(nb):
+                cat = "Top Chord"
+            elif dx < 1e-6:
+                cat = "Vertical"
+            else:
+                cat = "Diagonal"
+
+            key = (cat, profile)
+            if key not in groups:
+                groups[key] = {"category": cat, "profile": profile,
+                               "count": 0, "total_length": 0.0}
+            groups[key]["count"] += 1
+            groups[key]["total_length"] += length
+
+        # Attach weight info and sort by logical order
+        cat_order = {"Top Chord": 0, "Bottom Chord": 1, "Vertical": 2, "Diagonal": 3}
+        rows = []
+        for (cat, profile), data in sorted(groups.items(),
+                                           key=lambda x: cat_order.get(x[0][0], 9)):
+            area = STEEL_PROFILES.get(profile, {}).get("Area", 0.0)  # cm²
+            kg_per_m = area * 0.785          # steel density 7850 kg/m³
+            data["kg_per_m"]     = kg_per_m
+            data["total_weight"] = kg_per_m * data["total_length"]
+            rows.append(data)
+        return rows
+
+    def _classify_members(self):
+        """
+        Classify each element as 'Top Chord', 'Bottom Chord', or 'Web'.
+        Returns:
+          types   : list[str]  – one per element (index matches elements_data)
+          profiles: dict[str, set[str]]  – member_type → set of profile names
+        """
+        nodes = self.model.nodes_data
+        elems = self.model.elements_data
+        if not nodes or not elems:
+            return [], {}
+
+        ymin = min(n["y"] for n in nodes)
+        tol  = max((max(n["y"] for n in nodes) - ymin) * 0.05, 1e-6)
+
+        def is_bottom(n):
+            return n["y"] <= ymin + tol
+
+        types = []
+        profiles: dict = {"Top Chord": set(), "Bottom Chord": set(), "Web": set()}
+        for el in elems:
+            na, nb = nodes[el["node_a"] - 1], nodes[el["node_b"] - 1]
+            if is_bottom(na) and is_bottom(nb):
+                t = "Bottom Chord"
+            elif not is_bottom(na) and not is_bottom(nb):
+                t = "Top Chord"
+            else:
+                t = "Web"
+            types.append(t)
+            profiles[t].add(el["profile"])
+        return types, profiles
+
+    def _add_member_legend(self, ax):
+        """
+        Draw a compact legend box at upper-left showing profile per member type.
+        Uses matplotlib.legend.Legend directly so it never replaces an existing legend.
+        """
+        _, profiles = self._classify_members()
+        colour_map = {
+            "Top Chord":    "#E74C3C",
+            "Bottom Chord": "#2980B9",
+            "Web":          "#27AE60",
+        }
+        handles, labels = [], []
+        for mtype, colour in colour_map.items():
+            profs = profiles.get(mtype, set())
+            label = f"{mtype}: {', '.join(sorted(profs)) if profs else '—'}"
+            from matplotlib.lines import Line2D
+            handles.append(Line2D([0], [0], color=colour, lw=3))
+            labels.append(label)
+
+        from matplotlib.legend import Legend
+        leg = Legend(
+            ax, handles, labels,
+            loc="lower left",
+            bbox_to_anchor=(0, 1.01),
+            bbox_transform=ax.transAxes,
+            fontsize=7,
+            framealpha=0.88, edgecolor="#AAAAAA",
+            title="Member Types", title_fontsize=7,
+            borderaxespad=0,
+        )
+        ax.add_artist(leg)
+        try:
+            ax.figure.subplots_adjust(top=0.82)
+        except Exception:
+            pass
+
     def update_enhanced_plots(self):
         # Clear existing canvases
         for w in self.canvas_widgets: w.destroy()
         self.canvas_widgets.clear()
         if not self.ss: return
 
-        ff = UNIT_FORCE_TO_KN[self.unit_force]
-        lf = UNIT_LENGTH_TO_M[self.unit_length]
+        ff = UNIT_FORCE_TO_KN[self.model.unit_force]
+        lf = UNIT_LENGTH_TO_M[self.model.unit_length]
+        member_types, _ = self._classify_members()
 
-        # 1. Structure Model
-        fig_struct = self.ss.show_structure(show=False)
+        # 1. Structure Model — suppress anastruct load arrows; draw per-case arrows instead
+        fig_struct = self.ss.show_structure(verbosity=1, show=False)
         fig_struct.suptitle("1. Structure Model", fontsize=12, fontweight='bold')
+        ax_struct = fig_struct.gca()
+        # Re-add model node labels (verbosity=1 suppresses them)
+        xs_nd = [nd["x"] for nd in self.model.nodes_data]
+        ys_nd = [nd["y"] for nd in self.model.nodes_data]
+        _span1 = max(max(xs_nd) - min(xs_nd), max(ys_nd) - min(ys_nd), 1.0)
+        _off1  = _span1 * 0.015
+        for _i, _nd in enumerate(self.model.nodes_data):
+            ax_struct.text(_nd["x"] + _off1, _nd["y"] + _off1, str(_i + 1),
+                           fontsize=9, color="#334155", zorder=10)
+        self._draw_load_arrows_on_ax(ax_struct, _span1)
         self._rescale_graph_labels(fig_struct, "structure")
         self.scale_support_symbols(fig_struct)
         self.add_dimensions(fig_struct)
+        self._add_member_legend(ax_struct)
         self._add_to_right_panel(fig_struct)
 
         # 2. Axial Force Diagram (Professional Visualization)
         fig_axial, ax = plt.subplots(figsize=(12, 8))
-        ax.set_facecolor('white')
         try:
-            elem_ids = list(self.ss.element_map.keys())
-            max_f = max([abs(self.get_element_results(eid).get("N", 0.0)) for eid in elem_ids], default=1.0)
+            elem_ids = list(self.ss.elements.keys())
+            max_f = max([abs(self.ss.get_element_results(eid).get("N", 0.0)) for eid in elem_ids], default=1.0) or 1.0
             for elem_id, elem in self.ss.elements.items():
-                res = self.get_element_results(elem_id)
+                res = self.ss.get_element_results(elem_id)
                 force = res.get("N", 0.0)
                 start, end = elem['start'], elem['end']
-                color = '#E74C3C' if force > 0.1 else ('#2980B9' if force < -0.1 else '#7F8C8D')
-                fill_color = '#FDEDEC' if force > 0.1 else ('#EBF5FB' if force < -0.1 else '#F2F4F4')
+                color = '#C0392B' if force > 0.1 else ('#1A5276' if force < -0.1 else '#7F8C8D')
+                fill_color = '#FADBD8' if force > 0.1 else ('#D6EAF8' if force < -0.1 else '#F2F3F4')
                 lw = 3 + int(2 * abs(force) / max_f)
                 ax.plot([start[0], end[0]], [start[1], end[1]], color=color, linewidth=lw, alpha=0.9)
                 mid_x, mid_y = (start[0] + end[0])/2, (start[1] + end[1])/2
                 angle = math.degrees(math.atan2(end[1] - start[1], end[0] - start[0]))
                 if abs(angle) > 90: angle += 180
                 ax.text(mid_x, mid_y, f"{force / ff:.1f}", fontsize=8, fontweight='bold', ha='center', va='center',
-                       rotation=angle, bbox=dict(boxstyle="round,pad=0.2", fc=fill_color, ec=color, alpha=0.9))
+                       color="#0F172A", rotation=angle,
+                       bbox=dict(boxstyle="round,pad=0.2", fc=fill_color, ec=color, alpha=0.9))
             for node_id, node in self.ss.nodes.items():
                 ax.plot(node['x'], node['y'], 'ko', markersize=4, zorder=15)
-            ax.set_aspect('equal'); ax.grid(True, linestyle='--', alpha=0.3)
-            ax.set_title("Axial Force Diagram", fontsize=14, fontweight='bold')
+            ax.set_aspect('equal')
+            ax.grid(True, linestyle='--', alpha=0.4, color='#CBD5E1')
+            ax.set_title("2. Axial Force Diagram", fontsize=14, fontweight='bold', color='#0F172A')
+            ax.set_xlabel(f"X ({self.model.unit_length})", color='#334155')
+            ax.set_ylabel(f"Y ({self.model.unit_length})", color='#334155')
+            self._add_member_legend(ax)
             self._add_to_right_panel(fig_axial)
-        except Exception: pass
+        except Exception:
+            pass
 
-        # 3. Displacement Diagram with Deflection Values
+        # 3. Displacement Diagram with Deflection Check
         fig_disp = self.ss.show_displacement(show=False)
         ax_disp = fig_disp.gca()
         fig_disp.suptitle("3. Displacement Diagram (Scaled)", fontsize=12, fontweight='bold')
         displacements = self.ss.displacements
+        # Label max dy at each node
         for node_id, node in self.ss.nodes.items():
             if node_id in displacements:
                 dy = displacements[node_id]['dy']
-                ax_disp.text(node['x'], node['y'], f"N{node_id}: {dy*1000:.1f}mm", 
-                            fontsize=7, color='purple', ha='center', va='bottom')
-        self.scale_support_symbols(fig_disp); self.add_dimensions(fig_disp)
+                if abs(dy * 1000) > 0.01:
+                    ax_disp.text(node['x'], node['y'], f"N{node_id}: {dy*1000:.1f}mm",
+                                fontsize=7, color='purple', ha='center', va='bottom')
+        # Deflection limit check
+        xs_all = [n["x"] for n in self.model.nodes_data]
+        span_m = (max(xs_all) - min(xs_all)) * lf      # span in m
+        max_dy_mm = max(
+            (abs(displacements[nid]["dy"]) * 1000
+             for nid in self.ss.nodes if nid in displacements),
+            default=0.0,
+        )
+        if span_m > 0:
+            lim_240 = span_m * 1000 / 240
+            lim_360 = span_m * 1000 / 360
+            lim_420 = span_m * 1000 / 420
+            def _check(limit, val):
+                return "OK" if val <= limit else "FAIL"
+            defl_text = (
+                f"Span L = {span_m:.2f} m   |   Max δ = {max_dy_mm:.2f} mm\n"
+                f"L/240 = {lim_240:.1f} mm  [{_check(lim_240, max_dy_mm)}]\n"
+                f"L/360 = {lim_360:.1f} mm  [{_check(lim_360, max_dy_mm)}]\n"
+                f"L/420 = {lim_420:.1f} mm  [{_check(lim_420, max_dy_mm)}]"
+            )
+            all_ok = max_dy_mm <= lim_240
+            bg_color = "#E8F8F5" if all_ok else "#FDEDEC"
+            ax_disp.text(
+                0.99, 0.98, defl_text,
+                transform=ax_disp.transAxes,
+                fontsize=8, va="top", ha="right",
+                fontfamily="monospace",
+                bbox=dict(boxstyle="round,pad=0.5", fc=bg_color,
+                          ec="#27AE60" if all_ok else "#E74C3C", alpha=0.9),
+            )
+        self._add_member_legend(ax_disp)
+        self.scale_support_symbols(fig_disp)
+        self.add_dimensions(fig_disp)
         self._add_to_right_panel(fig_disp)
 
         # 4. Utilization Diagram
         fig_util, ax = plt.subplots(figsize=(12, 8))
-        ax.set_facecolor('white')
         try:
             if self.analysis_results:
                 for i, result in enumerate(self.analysis_results):
                     elem = self.ss.elements[i + 1]
                     util = result["utilization"]
-                    color = '#27AE60' if util <= 1.0 else '#E74C3C'
-                    ax.plot([elem['start'][0], elem['end'][0]], [elem['start'][1], elem['end'][1]], color=color, linewidth=2+min(util*3,6))
-                    mid_x, mid_y = (elem['start'][0] + elem['end'][0])/2, (elem['start'][1] + elem['end'][1])/2
-                    ax.text(mid_x, mid_y, f"{util:.2f}", fontsize=9, fontweight='bold', ha='center',
-                           bbox=dict(boxstyle="round,pad=0.2", fc='white', ec=color, alpha=0.8))
-                ax.set_aspect('equal'); ax.grid(True, linestyle='--', alpha=0.3)
-                ax.set_title("Member Utilization Diagram", fontsize=14, fontweight='bold')
+                    color = '#1D8348' if util <= 0.6 else ('#D4AC0D' if util <= 0.9 else ('#E67E22' if util <= 1.0 else '#C0392B'))
+                    ax.plot([elem['start'][0], elem['end'][0]], [elem['start'][1], elem['end'][1]],
+                            color=color, linewidth=2 + min(util * 3, 6))
+                    mid_x = (elem['start'][0] + elem['end'][0]) / 2
+                    mid_y = (elem['start'][1] + elem['end'][1]) / 2
+                    ax.text(mid_x, mid_y, f"{util:.2f}", fontsize=9, fontweight='bold',
+                            ha='center', color='#0F172A',
+                            bbox=dict(boxstyle="round,pad=0.2", fc='#FFFFFF', ec=color, alpha=0.9))
+                ax.set_aspect('equal')
+                ax.grid(True, linestyle='--', alpha=0.4, color='#CBD5E1')
+                ax.set_title("4. Member Utilization Diagram", fontsize=14, fontweight='bold', color='#0F172A')
+                ax.set_xlabel(f"X ({self.model.unit_length})", color='#334155')
+                ax.set_ylabel(f"Y ({self.model.unit_length})", color='#334155')
+                self._add_member_legend(ax)
                 self._add_to_right_panel(fig_util)
-        except Exception: pass
+        except Exception:
+            pass
+
+        # 5. Reaction Forces Diagram
+        try:
+            rf = self.ss.reaction_forces
+            if rf:
+                fig_react, ax = plt.subplots(figsize=(12, 8))
+
+                # Draw members (light grey)
+                for elem in self.ss.elements.values():
+                    ax.plot([elem['start'][0], elem['end'][0]],
+                            [elem['start'][1], elem['end'][1]],
+                            color='#94A3B8', linewidth=2, zorder=1)
+
+                # Draw nodes
+                for node in self.ss.nodes.values():
+                    ax.plot(node['x'], node['y'], 'o', color='#7F8C8D',
+                            markersize=5, zorder=2)
+
+                # Compute arrow scale relative to structure size
+                xs = [n['x'] for n in self.ss.nodes.values()]
+                ys = [n['y'] for n in self.ss.nodes.values()]
+                span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+                arrow_scale = span * 0.18
+                max_rf = max(
+                    (abs(v['Fx']) + abs(v['Fy']) for v in rf.values()),
+                    default=1.0
+                ) or 1.0
+
+                ff = UNIT_FORCE_TO_KN[self.model.unit_force]
+
+                for nid, node_rf in rf.items():
+                    x = node_rf['x']
+                    y = node_rf['y']
+                    rfx = -node_rf['Fx']
+                    rfy = -node_rf['Fy']
+
+                    fixed_len = span * 0.12  # fixed arrow length regardless of magnitude
+
+                    def _draw_arrow(dx, dy, val, color, label_offset):
+                        if abs(val) < 0.01:
+                            return
+                        if dy != 0:
+                            # Vertical: tail below node at negative y, head at node
+                            tail_xy = (x, y - fixed_len)
+                            head_xy = (x, y)
+                            lx = x + label_offset[0]
+                            ly = y - fixed_len + label_offset[1]
+                        else:
+                            # Horizontal: fixed length to the side
+                            ddx = (dx / abs(dx)) * fixed_len
+                            tail_xy = (x, y)
+                            head_xy = (x + ddx, y)
+                            lx = x + ddx + label_offset[0]
+                            ly = y + label_offset[1]
+                        ax.annotate(
+                            '', xy=head_xy, xytext=tail_xy,
+                            arrowprops=dict(arrowstyle='->', color=color,
+                                           lw=2.5, mutation_scale=18),
+                            zorder=5,
+                        )
+                        ax.text(lx, ly,
+                                f"{abs(val) / ff:.2f} {self.model.unit_force}",
+                                fontsize=9, fontweight='bold', color=color,
+                                ha='center', va='center',
+                                bbox=dict(boxstyle='round,pad=0.25',
+                                          fc='white', ec=color, alpha=0.85),
+                                zorder=6)
+
+                    offset_x = span * 0.03
+                    offset_y = span * 0.06
+                    _draw_arrow(rfx, 0,   rfx, '#E74C3C', (0,  offset_y))
+                    _draw_arrow(0,   rfy, rfy, '#2980B9', (offset_x, 0))
+                    ax.text(x, y - span * 0.06, f"N{nid}",
+                            fontsize=8, color='#334155', ha='center', zorder=6)
+
+                from matplotlib.lines import Line2D
+                legend_elems = [
+                    Line2D([0], [0], color='#E74C3C', lw=2, label='Fx (Horizontal)'),
+                    Line2D([0], [0], color='#2980B9', lw=2, label='Fy (Vertical)'),
+                ]
+                ax.legend(handles=legend_elems, loc='upper right', fontsize=9)
+                self._add_member_legend(ax)  # adds its own legend at upper-left
+
+                ax.set_aspect('equal')
+                ax.grid(True, linestyle='--', alpha=0.4, color='#CBD5E1')
+                ax.set_title("5. Reaction Forces Diagram", fontsize=14, fontweight='bold', color='#0F172A')
+                ax.set_xlabel(f"X ({self.model.unit_length})", color='#334155')
+                ax.set_ylabel(f"Y ({self.model.unit_length})", color='#334155')
+                self._add_to_right_panel(fig_react)
+        except Exception as _e5:
+            import traceback; traceback.print_exc()
+            try:
+                plt.close(fig_react)
+            except Exception:
+                pass
 
     def _add_to_right_panel(self, fig):
-        fig.set_facecolor("#f0f0f0")
+        _force_light_fig(fig)
         canvas = FigureCanvasTkAgg(fig, master=self.right_panel)
         canvas.draw()
-        
+        plt.close(fig)
+
         # Add Toolbar
         toolbar_frame = ctk.CTkFrame(self.right_panel, fg_color="transparent")
         toolbar_frame.pack(fill="x", padx=10)
@@ -1150,7 +1532,10 @@ class TrussAnalyzerPro(ctk.CTk):
 
     def show_enhanced_results(self):
         """Enhanced results display with comprehensive member checks"""
-        for w in self.tab_res.winfo_children(): w.destroy()
+        self.update_idletasks()
+        for w in self.tab_res.winfo_children():
+            try: w.destroy()
+            except Exception: pass
         
         if not self.ss or not self.analysis_results:
             ctk.CTkLabel(self.tab_res, text="No analysis results available. Run analysis first.", 
@@ -1169,7 +1554,7 @@ class TrussAnalyzerPro(ctk.CTk):
         info_frame = ctk.CTkFrame(header, fg_color=COLOR_PALETTE["surface"])
         info_frame.pack(fill="x", pady=5)
         
-        info_text = f"Project: {self.project_data['name']} | Method: {self.design_method} | Combination: {self.selected_combo}"
+        info_text = f"Project: {self.model.project_data['name']} | Method: {self.model.design_method} | Combination: {self.model.selected_combo}"
         ctk.CTkLabel(info_frame, text=info_text, font=TYPO_SCALE["small"]).pack(pady=5)
         
         # Results table
@@ -1180,7 +1565,9 @@ class TrussAnalyzerPro(ctk.CTk):
         headers_frame = ctk.CTkFrame(table_frame, fg_color=COLOR_PALETTE["secondary"])
         headers_frame.pack(fill="x", pady=2)
         
-        headers = ["Member", "Profile", "Force (kN)", "Type", "Utilization", "Status", "Properties"]
+        fu = self.model.unit_force
+        ff_res = UNIT_FORCE_TO_KN[fu]
+        headers = ["Member", "Profile", f"Force ({fu})", "Type", "Utilization", "Status", "Properties"]
         widths = [60, 140, 80, 80, 80, 60, 200]
         
         for header, width in zip(headers, widths):
@@ -1201,9 +1588,10 @@ class TrussAnalyzerPro(ctk.CTk):
             ctk.CTkLabel(row_frame, text=result["profile"], width=140, 
                         font=TYPO_SCALE["small"]).pack(side="left", padx=2, pady=3)
             
-            # Force
-            force_text = f"{result['force']:.1f}"
-            ctk.CTkLabel(row_frame, text=force_text, width=80, 
+            # Force — convert from kN to display unit
+            force_display = result['force'] / ff_res
+            force_text = f"{force_display:.2f}"
+            ctk.CTkLabel(row_frame, text=force_text, width=80,
                         font=TYPO_SCALE["mono"]).pack(side="left", padx=2, pady=3)
             
             # Type
@@ -1245,33 +1633,196 @@ class TrussAnalyzerPro(ctk.CTk):
         if failed_members > 0:
             warning_frame = ctk.CTkFrame(summary_frame, fg_color=COLOR_PALETTE["warning"])
             warning_frame.pack(fill="x", pady=5)
-            ctk.CTkLabel(warning_frame, text="⚠️ WARNING: Some members exceed capacity. Consider larger sections or design modifications.", 
+            ctk.CTkLabel(warning_frame, text="⚠️ WARNING: Some members exceed capacity. Consider larger sections or design modifications.",
                         font=TYPO_SCALE["small"]).pack(pady=5)
-    
+
+        # ── Bill of Materials ────────────────────────────────────────────
+        bom_rows = self._compute_bom()
+        if bom_rows:
+            lu = self.model.unit_length
+            lf = UNIT_LENGTH_TO_M[lu]
+
+            bom_outer = ctk.CTkFrame(self.tab_res, fg_color=COLOR_PALETTE["surface"], corner_radius=8)
+            bom_outer.pack(fill="x", padx=10, pady=(6, 10))
+
+            # Title bar
+            bom_title = ctk.CTkFrame(bom_outer, fg_color=COLOR_PALETTE["header_bar"], corner_radius=6)
+            bom_title.pack(fill="x", padx=6, pady=(6, 4))
+            ctk.CTkLabel(bom_title,
+                         text="Bill of Materials  —  Steel Quantity Takeoff",
+                         font=TYPO_SCALE["h3"], text_color="#FFFFFF").pack(side="left", padx=12, pady=6)
+
+            # Column headers
+            CAT_COLORS = {
+                "Top Chord":    "#E74C3C",
+                "Bottom Chord": "#2980B9",
+                "Vertical":     "#27AE60",
+                "Diagonal":     "#F39C12",
+            }
+            bom_hdr = ctk.CTkFrame(bom_outer, fg_color=COLOR_PALETTE["secondary"])
+            bom_hdr.pack(fill="x", padx=6, pady=(0, 2))
+            for txt, w in [("Category", 120), ("Profile", 150), ("Qty", 40),
+                           (f"Length ({lu})", 90), ("kg/m", 60), ("Weight (kg)", 90)]:
+                ctk.CTkLabel(bom_hdr, text=txt, width=w, font=TYPO_SCALE["small"],
+                             text_color="#FFFFFF").pack(side="left", padx=3, pady=4)
+
+            # Data rows
+            total_len = 0.0
+            total_wt  = 0.0
+            for row in bom_rows:
+                r_fg = COLOR_PALETTE["row_alt"] if bom_rows.index(row) % 2 == 0 else COLOR_PALETTE["surface"]
+                r = ctk.CTkFrame(bom_outer, fg_color=r_fg)
+                r.pack(fill="x", padx=6, pady=1)
+
+                # Colour swatch for category
+                cat_color = CAT_COLORS.get(row["category"], COLOR_PALETTE["text_secondary"])
+                ctk.CTkLabel(r, text="█", width=12,
+                             font=TYPO_SCALE["small"], text_color=cat_color).pack(side="left", padx=(4, 0))
+                ctk.CTkLabel(r, text=row["category"], width=108,
+                             font=TYPO_SCALE["small"],
+                             text_color=COLOR_PALETTE["text_primary"]).pack(side="left", padx=2, pady=3)
+                ctk.CTkLabel(r, text=row["profile"], width=150,
+                             font=TYPO_SCALE["mono"],
+                             text_color=COLOR_PALETTE["text_primary"]).pack(side="left", padx=2, pady=3)
+                ctk.CTkLabel(r, text=str(row["count"]), width=40,
+                             font=TYPO_SCALE["mono"],
+                             text_color=COLOR_PALETTE["text_primary"]).pack(side="left", padx=2, pady=3)
+                disp_len = row["total_length"] / lf
+                ctk.CTkLabel(r, text=f"{disp_len:.2f}", width=90,
+                             font=TYPO_SCALE["mono"],
+                             text_color=COLOR_PALETTE["text_primary"]).pack(side="left", padx=2, pady=3)
+                ctk.CTkLabel(r, text=f"{row['kg_per_m']:.2f}", width=60,
+                             font=TYPO_SCALE["mono"],
+                             text_color=COLOR_PALETTE["text_secondary"]).pack(side="left", padx=2, pady=3)
+                ctk.CTkLabel(r, text=f"{row['total_weight']:.1f}", width=90,
+                             font=TYPO_SCALE["mono"],
+                             text_color=COLOR_PALETTE["accent"]).pack(side="left", padx=2, pady=3)
+                total_len += row["total_length"]
+                total_wt  += row["total_weight"]
+
+            # Totals row
+            tot = ctk.CTkFrame(bom_outer, fg_color=COLOR_PALETTE["header_bar"])
+            tot.pack(fill="x", padx=6, pady=(2, 6))
+            ctk.CTkLabel(tot, text="", width=12).pack(side="left", padx=4)
+            ctk.CTkLabel(tot, text="TOTAL", width=108, font=TYPO_SCALE["h3"],
+                         text_color="#FFFFFF").pack(side="left", padx=2, pady=4)
+            ctk.CTkLabel(tot, text="", width=150).pack(side="left", padx=2)
+            ctk.CTkLabel(tot, text=str(sum(r["count"] for r in bom_rows)), width=40,
+                         font=TYPO_SCALE["h3"], text_color="#FFFFFF").pack(side="left", padx=2, pady=4)
+            ctk.CTkLabel(tot, text=f"{total_len / lf:.2f}", width=90,
+                         font=TYPO_SCALE["h3"], text_color="#FFFFFF").pack(side="left", padx=2, pady=4)
+            ctk.CTkLabel(tot, text="", width=60).pack(side="left", padx=2)
+            ctk.CTkLabel(tot, text=f"{total_wt:.1f}", width=90,
+                         font=TYPO_SCALE["h3"], text_color="#F59E0B").pack(side="left", padx=2, pady=4)
+
+    def _draw_load_arrows_on_ax(self, ax, span):
+        """Draw per-case coloured load arrows (Fx horizontal, Fy vertical) on existing axes."""
+        arrow_len  = max(span * 0.13, 0.1)
+        lbl_off    = span * 0.04
+
+        for ld in self.model.loads_data:
+            if not (1 <= ld["node_id"] <= len(self.model.nodes_data)):
+                continue
+            nd    = self.model.nodes_data[ld["node_id"] - 1]
+            x, y  = nd["x"], nd["y"]
+            color = CASE_COLORS.get(ld.get("case", "DL"), "#555555")
+            fx    = ld.get("fx", 0.0)
+            fy    = ld.get("fy", 0.0)
+
+            if abs(fx) > 1e-6:
+                sign = 1 if fx > 0 else -1
+                # tail offset from node in opposite direction, head at node
+                ax.annotate("", xy=(x, y), xytext=(x - sign * arrow_len, y),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=2, mutation_scale=14))
+                ax.text(x - sign * (arrow_len + lbl_off), y + lbl_off * 0.6,
+                    f"Fx={fx:.0f}", fontsize=7, color=color,
+                    ha="center", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.85))
+
+            if abs(fy) > 1e-6:
+                sign = 1 if fy > 0 else -1
+                ax.annotate("", xy=(x, y), xytext=(x, y - sign * arrow_len),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=2, mutation_scale=14))
+                ax.text(x + lbl_off * 0.6, y - sign * (arrow_len + lbl_off),
+                    f"Fy={fy:.0f}", fontsize=7, color=color,
+                    ha="left", va="center",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.85))
+
+        # Legend per case
+        from matplotlib.lines import Line2D
+        from matplotlib.legend import Legend
+        present = {ld.get("case", "DL") for ld in self.model.loads_data}
+        handles = [Line2D([0], [0], color=CASE_COLORS.get(c, "#555"), lw=2.5, label=c)
+                   for c in ["DL", "LL", "WL", "SL"] if c in present]
+        if handles:
+            leg = Legend(ax, handles, [h.get_label() for h in handles],
+                         loc="lower left", bbox_to_anchor=(0, 1.01),
+                         bbox_transform=ax.transAxes,
+                         fontsize=7, title="Load Cases", title_fontsize=7,
+                         framealpha=0.88, edgecolor="#AAAAAA", borderaxespad=0)
+            ax.add_artist(leg)
+            try:
+                ax.figure.subplots_adjust(top=0.80)
+            except Exception:
+                pass
+
+    def _remap_node_labels(self, fig, ss):
+        """Replace anastruct internal node IDs with model 1-based indices in a figure."""
+        coord_to_model = {}
+        for i, nd in enumerate(self.model.nodes_data):
+            coord_to_model[(round(nd["x"], 6), round(nd["y"], 6))] = i + 1
+        ana_to_model = {}
+        for ana_id, ana_nd in ss.nodes.items():
+            key = (round(ana_nd["x"], 6), round(ana_nd["y"], 6))
+            if key in coord_to_model:
+                ana_to_model[ana_id] = coord_to_model[key]
+        if not ana_to_model:
+            return
+        for ax in fig.get_axes():
+            for txt in ax.texts:
+                try:
+                    val = int(txt.get_text())
+                    if val in ana_to_model:
+                        txt.set_text(str(ana_to_model[val]))
+                except (ValueError, AttributeError):
+                    pass
+
     def update_structure_preview(self, temp_ss):
         """Update structure preview visualization"""
         try:
             # Clear existing preview canvases
-            for w in self.canvas_widgets: 
+            for w in self.canvas_widgets:
                 w.destroy()
             self.canvas_widgets.clear()
-            
-            # Generate structure preview
+
+            # show_structure with no loads on temp_ss → only members/supports/node labels
             fig_struct = temp_ss.show_structure(show=False)
-            fig_struct.suptitle("🔍 Live Structure Preview", fontsize=12, fontweight='bold')
+            fig_struct.suptitle("Live Structure Preview", fontsize=12, fontweight='bold')
+            self._remap_node_labels(fig_struct, temp_ss)
+
+            # Draw per-case load arrows on top
+            ax = fig_struct.gca()
+            xs = [nd["x"] for nd in self.model.nodes_data]
+            ys = [nd["y"] for nd in self.model.nodes_data]
+            span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) if xs else 1.0
+            self._draw_load_arrows_on_ax(ax, span)
+
             self._add_to_right_panel(fig_struct)
-            
+
         except Exception as e:
             # If preview fails, show error message
             fig, ax = plt.subplots(figsize=(8, 4))
-            ax.text(0.5, 0.5, f"Preview Error: {str(e)}", ha="center", va="center", 
+            ax.text(0.5, 0.5, f"Preview Error: {str(e)}", ha="center", va="center",
                    transform=ax.transAxes, fontsize=12, color='red')
             ax.set_title("Structure Preview")
             self._add_to_right_panel(fig)
         
     def draw_project_tab(self):
         """Enhanced project information tab"""
-        for w in self.tab_proj.winfo_children(): w.destroy()
+        self.update_idletasks()
+        for w in self.tab_proj.winfo_children():
+            try: w.destroy()
+            except Exception: pass
         
         # Header
         header = ctk.CTkFrame(self.tab_proj, fg_color="transparent")
@@ -1284,7 +1835,7 @@ class TrussAnalyzerPro(ctk.CTk):
         details_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
         self.project_entries = {}
-        for key, value in self.project_data.items():
+        for key, value in self.model.project_data.items():
             row_frame = ctk.CTkFrame(details_frame, fg_color=COLOR_PALETTE["surface"])
             row_frame.pack(fill="x", pady=5)
             
@@ -1301,155 +1852,217 @@ class TrussAnalyzerPro(ctk.CTk):
         units_frame = ctk.CTkFrame(self.tab_proj, fg_color=COLOR_PALETTE["surface"])
         units_frame.pack(fill="x", padx=10, pady=10)
         
-        ctk.CTkLabel(units_frame, text="⚖️ Units", font=TYPO_SCALE["h3"]).pack(pady=10)
-        
+        ctk.CTkLabel(units_frame, text="Units", font=TYPO_SCALE["h3"]).pack(pady=10)
+
+        # Fixed input unit notice
+        notice = ctk.CTkFrame(units_frame, fg_color=COLOR_PALETTE["secondary"], corner_radius=8)
+        notice.pack(fill="x", padx=15, pady=(0, 8))
+        ctk.CTkLabel(notice, text="Input units (fixed)",
+                     font=TYPO_SCALE["small"], text_color=COLOR_PALETTE["text_secondary"]).pack(pady=(6, 0))
+        ctk.CTkLabel(notice,
+                     text="Node coordinates: m     |     Loads: kN     |     Stress: MPa",
+                     font=TYPO_SCALE["body"], text_color=COLOR_PALETTE["text_primary"]).pack(pady=(0, 6))
+
         units_grid = ctk.CTkFrame(units_frame, fg_color="transparent")
-        units_grid.pack(fill="x", padx=10, pady=10)
-        
-        ctk.CTkLabel(units_grid, text="Force:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.force_unit_var = ctk.StringVar(value=self.unit_force)
-        ctk.CTkOptionMenu(units_grid, values=["kN", "N", "tf", "kgf", "kip"], 
-                         variable=self.force_unit_var).grid(row=0, column=1, padx=5, pady=5)
-        
-        ctk.CTkLabel(units_grid, text="Length:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.length_unit_var = ctk.StringVar(value=self.unit_length)
-        ctk.CTkOptionMenu(units_grid, values=["m", "cm", "mm", "in", "ft"], 
-                         variable=self.length_unit_var).grid(row=1, column=1, padx=5, pady=5)
+        units_grid.pack(fill="x", padx=10, pady=6)
+
+        ctk.CTkLabel(units_grid, text="Display force:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.force_unit_var = ctk.StringVar(value=self.model.unit_force)
+        ctk.CTkOptionMenu(units_grid, values=["kN", "N", "tf", "kgf", "kip"],
+                          variable=self.force_unit_var,
+                          command=lambda v: setattr(self.model, "unit_force", v)).grid(
+                          row=0, column=1, padx=5, pady=5)
+
+        ctk.CTkLabel(units_grid, text="Display length:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.length_unit_var = ctk.StringVar(value=self.model.unit_length)
+        ctk.CTkOptionMenu(units_grid, values=["m", "cm", "mm", "in", "ft"],
+                          variable=self.length_unit_var,
+                          command=lambda v: setattr(self.model, "unit_length", v)).grid(
+                          row=1, column=1, padx=5, pady=5)
+
+        ctk.CTkLabel(units_grid,
+                     text="* Changes display labels only. Re-run analysis to refresh plots.",
+                     font=TYPO_SCALE["small"],
+                     text_color=COLOR_PALETTE["text_secondary"]).grid(
+                     row=2, column=0, columnspan=2, padx=5, pady=(2, 8), sticky="w")
 
     def draw_templates_tab(self):
-        for w in self.tab_templ.winfo_children(): w.destroy()
-        
-        # Header
-        header = ctk.CTkFrame(self.tab_templ, fg_color="transparent")
-        header.pack(fill="x", padx=10, pady=10)
-        ctk.CTkLabel(header, text="🏗️ Advanced Parametric Truss Generator", 
-                     font=TYPO_SCALE["h3"], text_color=COLOR_PALETTE["text_primary"]).pack()
-        
-        # Main split: Left for Selection Grid, Right for Parameters
-        main_frame = ctk.CTkFrame(self.tab_templ, fg_color="transparent")
-        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # Grid Configuration for main_frame
-        main_frame.grid_columnconfigure(0, weight=3) # Selection list
-        main_frame.grid_columnconfigure(1, weight=1, minsize=320) # Parameters
-        main_frame.grid_rowconfigure(0, weight=1)
+        self.update_idletasks()
+        for w in self.tab_templ.winfo_children():
+            try: w.destroy()
+            except Exception: pass
 
-        # Left Side: Categorized Selection Grid (Scrollable)
-        selection_panel = ctk.CTkScrollableFrame(main_frame, fg_color=COLOR_PALETTE["surface"])
-        selection_panel.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        
+        # ── Vertical single-column layout (fits inside 420px left panel) ──
+        # [Scrollable area: type selector + params + profiles]
+        # [Fixed Generate button at bottom]
+
+        outer = ctk.CTkFrame(self.tab_templ, fg_color="transparent")
+        outer.pack(fill="both", expand=True)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_rowconfigure(1, weight=0)
+        outer.grid_columnconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(outer, fg_color="transparent")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        # ── Section: Type Selector ───────────────────────────────────────
+        ctk.CTkLabel(scroll, text="Truss Type",
+                     font=TYPO_SCALE["h3"],
+                     text_color=COLOR_PALETTE["text_primary"]).pack(anchor="w", padx=8, pady=(8, 2))
+
         TRUSS_CATEGORIES = {
-            "Pitched Trusses": ["Howe", "Pratt", "Fan", "Fink", "King Post", "Scissors", "Modified Scissors"],
-            "Mono / Half Trusses": ["Monopith", "Half Howe", "Half Pratt", "Half Warren", "Half Scissors"],
-            "Flat / Parallel": ["Parallel Chord", "Warren (Flat)", "Modified Warren"],
-            "Curved & Special": ["Bowstring", "Curved Truss 1", "Curved Truss 2", "Single Cantilever", "Double Stub End"]
+            "Pitched": ["Howe", "Pratt", "Fan", "Fink", "King Post", "Scissors", "Modified Scissors"],
+            "Half / Mono": ["Monopith", "Half Howe", "Half Pratt", "Half Warren", "Half Scissors"],
+            "Flat": ["Parallel Chord", "Warren (Flat)", "Modified Warren"],
+            "Special": ["Bowstring", "Curved Truss 1", "Curved Truss 2", "Single Cantilever", "Double Stub End"],
         }
-        
+
+        # Button colour helpers — readable in both light and dark mode
+        def _btn_idle():
+            return {"fg_color": COLOR_PALETTE["row_alt"],
+                    "text_color": COLOR_PALETTE["text_primary"],
+                    "border_color": COLOR_PALETTE["text_secondary"],
+                    "border_width": 1,
+                    "hover_color": COLOR_PALETTE["secondary"]}
+
+        def _btn_active():
+            return {"fg_color": COLOR_PALETTE["primary"],
+                    "text_color": "#FFFFFF",
+                    "border_color": COLOR_PALETTE["accent"],
+                    "border_width": 2,
+                    "hover_color": COLOR_PALETTE["accent"]}
+
         self.template_btn_map = {}
         for cat, types in TRUSS_CATEGORIES.items():
-            cat_label = ctk.CTkLabel(selection_panel, text=cat, font=TYPO_SCALE["h3"], 
-                                    text_color=COLOR_PALETTE["accent"])
-            cat_label.pack(anchor="w", padx=10, pady=(15, 5))
-            
-            grid = ctk.CTkFrame(selection_panel, fg_color="transparent")
-            grid.pack(fill="x", padx=5)
-            
+            ctk.CTkLabel(scroll, text=cat,
+                         font=TYPO_SCALE["small"],
+                         text_color=COLOR_PALETTE["accent"]).pack(anchor="w", padx=10, pady=(10, 2))
+
+            # 3 columns to fit ~400px without overflow
+            grid = ctk.CTkFrame(scroll, fg_color="transparent")
+            grid.pack(fill="x", padx=6, pady=2)
+            grid.grid_columnconfigure((0, 1, 2), weight=1)
+
             for i, t_type in enumerate(types):
-                btn = ctk.CTkButton(grid, text=t_type, width=140, height=45,
-                                   fg_color=COLOR_PALETTE["surface"] if t_type != self.selected_template else COLOR_PALETTE["primary"],
-                                   border_width=1, border_color=COLOR_PALETTE["secondary"],
-                                   command=lambda t=t_type: self.select_truss_template(t))
-                btn.grid(row=i//2, column=i%2, padx=5, pady=5, sticky="nsew")
+                style = _btn_active() if t_type == self.model.selected_template else _btn_idle()
+                btn = ctk.CTkButton(
+                    grid, text=t_type, height=32,
+                    font=TYPO_SCALE["small"],
+                    command=lambda t=t_type: self.select_truss_template(t),
+                    **style,
+                )
+                btn.grid(row=i // 3, column=i % 3, padx=3, pady=3, sticky="ew")
                 self.template_btn_map[t_type] = btn
 
-        # Right Side: Fixed Layout for Parameters & Button
-        param_container = ctk.CTkFrame(main_frame, width=320, fg_color=COLOR_PALETTE["surface"])
-        param_container.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-        
-        # Grid Configuration for param_container
-        param_container.grid_rowconfigure(0, weight=1) # Scrollable area
-        param_container.grid_rowconfigure(1, weight=0) # Fixed button area
-        param_container.grid_columnconfigure(0, weight=1)
+        # ── Section: Mini Preview ────────────────────────────────────────
+        ctk.CTkFrame(scroll, height=1, fg_color=COLOR_PALETTE["text_secondary"]).pack(
+            fill="x", padx=8, pady=(12, 6))
+        ctk.CTkLabel(scroll, text="Preview",
+                     font=TYPO_SCALE["h3"],
+                     text_color=COLOR_PALETTE["text_primary"]).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # --- SCROLLABLE PARAMETERS SECTION ---
-        scroll_params = ctk.CTkScrollableFrame(param_container, fg_color="transparent")
-        scroll_params.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        
-        # 1. Mini Preview Section
-        ctk.CTkLabel(scroll_params, text="🔍 Mini Preview", font=TYPO_SCALE["h3"]).pack(pady=(10, 5))
-        self.mini_preview_frame = ctk.CTkFrame(scroll_params, height=180, fg_color="#f0f0f0", corner_radius=10)
-        self.mini_preview_frame.pack(fill="x", padx=10, pady=5)
-        
-        # Instruction Hint
-        hint_text = "1. Select Type  2. Adjust Params\n3. Click 'Generate'  4. Analysis (Left)"
-        ctk.CTkLabel(scroll_params, text=hint_text, font=TYPO_SCALE["small"], 
-                    text_color=COLOR_PALETTE["text_secondary"], justify="left").pack(padx=10, pady=5)
+        self.mini_preview_frame = ctk.CTkFrame(
+            scroll, height=150,
+            fg_color="#FFFFFF",
+            corner_radius=8)
+        self.mini_preview_frame.pack(fill="x", padx=8, pady=4)
 
-        ctk.CTkLabel(scroll_params, text="⚙️ Parameters", font=TYPO_SCALE["h3"]).pack(pady=(15, 5))
-        
-        # Helper to create input rows
-        def create_param_row(container, label, key, default_val):
-            row = ctk.CTkFrame(container, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=5)
-            ctk.CTkLabel(row, text=label, width=100, anchor="w").pack(side="left")
-            entry = ctk.CTkEntry(row, width=100, font=TYPO_SCALE["mono"])
-            entry.insert(0, str(self.template_params.get(key, default_val)))
-            entry.pack(side="right")
-            entry.bind('<KeyRelease>', lambda e: self.update_template_param(key, entry.get()))
-            return entry
+        # ── Section: Parameters ──────────────────────────────────────────
+        ctk.CTkFrame(scroll, height=1, fg_color=COLOR_PALETTE["text_secondary"]).pack(
+            fill="x", padx=8, pady=(10, 6))
+        ctk.CTkLabel(scroll, text="Parameters",
+                     font=TYPO_SCALE["h3"],
+                     text_color=COLOR_PALETTE["text_primary"]).pack(anchor="w", padx=8, pady=(0, 4))
 
-        # Common Parameters
-        self.span_entry = create_param_row(scroll_params, "Span (m):", "span", 12.0)
-        self.height_entry = create_param_row(scroll_params, "Height (m):", "height", 3.0)
-        self.bays_entry = create_param_row(scroll_params, "Bays:", "bays", 6)
-        
-        # Context-Specific Parameters
-        self.extra_params_frame = ctk.CTkFrame(scroll_params, fg_color="transparent")
-        self.extra_params_frame.pack(fill="x", pady=5)
+        def _param_row(label, key, default_val):
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=3)
+            row.grid_columnconfigure(0, weight=1)
+            row.grid_columnconfigure(1, weight=0)
+            ctk.CTkLabel(row, text=label, font=TYPO_SCALE["small"],
+                         text_color=COLOR_PALETTE["text_primary"],
+                         anchor="w").grid(row=0, column=0, sticky="w")
+            ent = ctk.CTkEntry(row, width=90, font=TYPO_SCALE["mono"])
+            ent.insert(0, str(self.model.template_params.get(key, default_val)))
+            ent.grid(row=0, column=1)
+            ent.bind("<KeyRelease>", lambda e: self.update_template_param(key, ent.get()))
+            return ent
+
+        self.span_entry   = _param_row("Span (m):",   "span",   12.0)
+        self.height_entry = _param_row("Height (m):", "height",  3.0)
+        self.bays_entry   = _param_row("Bays:",       "bays",      6)
+
+        self.extra_params_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self.extra_params_frame.pack(fill="x")
         self.update_extra_param_fields()
-        
-        # Profile Selection Section
-        ctk.CTkLabel(scroll_params, text="🔧 Profiles", font=TYPO_SCALE["h3"]).pack(pady=(20, 5))
-        
-        def create_profile_row(container, label, var_name, default):
-            row = ctk.CTkFrame(container, fg_color="transparent")
-            row.pack(fill="x", padx=10, pady=2)
-            ctk.CTkLabel(row, text=label, width=80, anchor="w", font=TYPO_SCALE["small"]).pack(side="left")
+
+        # ── Section: Profiles ────────────────────────────────────────────
+        ctk.CTkFrame(scroll, height=1, fg_color=COLOR_PALETTE["text_secondary"]).pack(
+            fill="x", padx=8, pady=(10, 6))
+        ctk.CTkLabel(scroll, text="Profiles",
+                     font=TYPO_SCALE["h3"],
+                     text_color=COLOR_PALETTE["text_primary"]).pack(anchor="w", padx=8, pady=(0, 4))
+
+        def _profile_row(label, var_name, default):
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=3)
+            ctk.CTkLabel(row, text=label, width=62, anchor="w",
+                         font=TYPO_SCALE["small"],
+                         text_color=COLOR_PALETTE["text_primary"]).pack(side="left")
             var = ctk.StringVar(value=default)
-            menu = ctk.CTkOptionMenu(row, values=list(STEEL_PROFILES.keys()), variable=var, 
-                                    height=28, font=TYPO_SCALE["small"])
-            menu.pack(side="right", fill="x", expand=True)
+            menu = ctk.CTkOptionMenu(
+                row, values=list(STEEL_PROFILES.keys()), variable=var,
+                height=28, font=TYPO_SCALE["small"],
+                fg_color=COLOR_PALETTE["primary"],
+                button_color=COLOR_PALETTE["secondary"],
+                button_hover_color=COLOR_PALETTE["accent"],
+                text_color="#FFFFFF",
+                dynamic_resizing=False,
+            )
+            menu.pack(side="left", fill="x", expand=True)
             setattr(self, var_name + "_var", var)
             return menu
 
-        self.top_chord_profile_menu = create_profile_row(scroll_params, "Top:", "top_chord_profile", "I-Beam IPE160")
-        self.bottom_chord_profile_menu = create_profile_row(scroll_params, "Bottom:", "bottom_chord_profile", "I-Beam IPE160")
-        self.web_profile_menu = create_profile_row(scroll_params, "Webs:", "web_profile", "Box 50x50x2.3")
-        
-        # --- FIXED BOTTOM BUTTON SECTION ---
-        gen_btn_frame = ctk.CTkFrame(param_container, fg_color="transparent", height=80)
-        gen_btn_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
-        gen_btn_frame.grid_propagate(False)
-        
-        gen_btn = ctk.CTkButton(gen_btn_frame, text="🏗️ GENERATE TRUSS", height=60,
-                               fg_color=COLOR_PALETTE["success"], font=TYPO_SCALE["h3"],
-                               command=self.generate_parametric_truss)
-        gen_btn.pack(fill="both", expand=True)
-        
+        self.top_chord_profile_menu    = _profile_row("Top:",    "top_chord_profile",    "I-Beam IPE160")
+        self.bottom_chord_profile_menu = _profile_row("Bottom:", "bottom_chord_profile", "I-Beam IPE160")
+        self.web_profile_menu          = _profile_row("Webs:",   "web_profile",          "Box 50x50x2.3")
+
+        # ── Fixed Generate Button ────────────────────────────────────────
+        gen_frame = ctk.CTkFrame(outer, fg_color="transparent")
+        gen_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+        ctk.CTkButton(
+            gen_frame, text="GENERATE TRUSS", height=44,
+            fg_color=COLOR_PALETTE["success"],
+            hover_color="#065F46",
+            text_color="#FFFFFF",
+            font=TYPO_SCALE["h3"],
+            command=self.generate_parametric_truss,
+        ).pack(fill="x")
+
         # Initial preview
         self.generate_preview_immediately()
 
     def select_truss_template(self, t_type):
         """Handle template selection and update UI state"""
-        # Reset old button color
-        if self.selected_template in self.template_btn_map:
-            self.template_btn_map[self.selected_template].configure(fg_color=COLOR_PALETTE["surface"])
-        
-        self.selected_template = t_type
-        
-        # Set new button color
+        # Reset old button to idle style
+        if self.model.selected_template in self.template_btn_map:
+            self.template_btn_map[self.model.selected_template].configure(
+                fg_color=COLOR_PALETTE["row_alt"],
+                text_color=COLOR_PALETTE["text_primary"],
+                border_color=COLOR_PALETTE["text_secondary"],
+                border_width=1,
+            )
+
+        self.model.selected_template = t_type
+
+        # Set new button to active style
         if t_type in self.template_btn_map:
-            self.template_btn_map[t_type].configure(fg_color=COLOR_PALETTE["primary"])
+            self.template_btn_map[t_type].configure(
+                fg_color=COLOR_PALETTE["primary"],
+                text_color="#FFFFFF",
+                border_color=COLOR_PALETTE["accent"],
+                border_width=2,
+            )
             
         self.update_extra_param_fields()
         self.generate_preview_immediately()
@@ -1458,9 +2071,9 @@ class TrussAnalyzerPro(ctk.CTk):
         """Update parameter value from entry"""
         try:
             if key == "bays":
-                self.template_params[key] = int(val)
+                self.model.template_params[key] = int(val)
             else:
-                self.template_params[key] = float(val)
+                self.model.template_params[key] = float(val)
             self.generate_preview_immediately()
         except ValueError:
             pass
@@ -1470,7 +2083,7 @@ class TrussAnalyzerPro(ctk.CTk):
         if not hasattr(self, 'extra_params_frame'): return
         for w in self.extra_params_frame.winfo_children(): w.destroy()
         
-        t = self.selected_template
+        t = self.model.selected_template
         
         if t in ["Scissors", "Modified Scissors", "Half Scissors"]:
             self._add_extra_field("Bottom H (m):", "bottom_height", 1.0)
@@ -1483,571 +2096,147 @@ class TrussAnalyzerPro(ctk.CTk):
 
     def _add_extra_field(self, label, key, default):
         row = ctk.CTkFrame(self.extra_params_frame, fg_color="transparent")
-        row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(row, text=label, width=100, anchor="w").pack(side="left")
-        entry = ctk.CTkEntry(row, width=100, font=TYPO_SCALE["mono"])
-        entry.insert(0, str(self.template_params.get(key, default)))
-        entry.pack(side="right")
-        entry.bind('<KeyRelease>', lambda e: self.update_template_param(key, entry.get()))
+        row.pack(fill="x", padx=8, pady=3)
+        row.grid_columnconfigure(0, weight=1)
+        row.grid_columnconfigure(1, weight=0)
+        ctk.CTkLabel(row, text=label, font=TYPO_SCALE["small"],
+                     text_color=COLOR_PALETTE["text_primary"],
+                     anchor="w").grid(row=0, column=0, sticky="w")
+        entry = ctk.CTkEntry(row, width=90, font=TYPO_SCALE["mono"])
+        entry.insert(0, str(self.model.template_params.get(key, default)))
+        entry.grid(row=0, column=1)
+        entry.bind("<KeyRelease>", lambda e: self.update_template_param(key, entry.get()))
+
+    def _get_profiles(self) -> dict:
+        return {
+            "top_chord":    self.top_chord_profile_var.get(),
+            "bottom_chord": self.bottom_chord_profile_var.get(),
+            "vertical":     self.web_profile_var.get(),
+            "diagonal":     self.web_profile_var.get(),
+        }
 
     def generate_parametric_truss(self):
-        """Generate parametric truss based on template and parameters"""
         try:
-            truss_type = self.selected_template
-            p = self.template_params
-            
-            # Get profiles from stored variables
-            profiles = {
-                'top_chord': self.top_chord_profile_var.get(),
-                'bottom_chord': self.bottom_chord_profile_var.get(),
-                'vertical': self.web_profile_var.get(),
-                'diagonal': self.web_profile_var.get()
-            }
-            
+            p = self.model.template_params
             if p["span"] <= 0 or p["height"] <= 0:
-                raise ValueError("Invalid dimensions: Span and Height must be positive")
-                
-            self.nodes_data, self.elements_data = [], []
-            
-            # Routing to generator methods
-            if truss_type == "Howe": self._generate_howe_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Pratt": self._generate_pratt_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Warren": self._generate_warren_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Fan": self._generate_fan_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Fink": self._generate_fink_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "King Post": self._generate_king_post_truss(p["span"], p["height"], profiles)
-            elif truss_type == "Scissors": self._generate_scissors_truss(p["span"], p["height"], p["bottom_height"], p["bays"], profiles)
-            elif truss_type == "Monopith": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Howe")
-            elif truss_type == "Half Howe": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Howe")
-            elif truss_type == "Half Pratt": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Pratt")
-            elif truss_type == "Half Warren": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Warren")
-            elif truss_type == "Parallel Chord": self._generate_parallel_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Warren (Flat)": self._generate_parallel_truss(p["span"], p["height"], p["bays"], profiles, "Warren")
-            elif truss_type == "Bowstring": self._generate_curved_truss(p["span"], p["height"], p["rise"], p["bays"], profiles, True)
-            elif "Curved Truss" in truss_type: self._generate_curved_truss(p["span"], p["height"], p["rise"], p["bays"], profiles, False)
-            elif truss_type == "Single Cantilever": self._generate_cantilever_truss(p["span"], p["height"], p["cantilever_len"], p["bays"], profiles)
-            elif truss_type == "Double Stub End": self._generate_stub_truss(p["span"], p["height"], p["stub_height"], p["bays"], profiles)
-            else: self._generate_warren_truss(p["span"], p["height"], p["bays"], profiles)
-            
-            # Add typical loading
-            self._add_template_loads()
-            
-            self.save_state()
+                raise ValueError("Span and Height must be positive")
+
+            profiles = self._get_profiles()
+            nodes, elements = TrussGenerators.generate(self.model.selected_template, p, profiles)
+            self.model.nodes_data = nodes
+            self.model.elements_data = elements
+            self.model.loads_data = TrussGenerators.default_loads(nodes)
+
+            self.model.save_state()
             self.refresh_ui()
             self.generate_preview_immediately()
-            self.update_status(f"✓ Generated {truss_type} truss", "success")
-            
+            self.update_status(f"✓ Generated {self.model.selected_template} truss", "success")
+
         except Exception as e:
-            messagebox.showerror("Template Error", f"Failed to generate truss: {str(e)}")
+            messagebox.showerror("Template Error", f"Failed to generate truss: {e}")
 
     def generate_preview_immediately(self):
-        """Generate structure preview immediately after template parameter changes"""
-        # Temporarily generate to nodes_data/elements_data
-        orig_nodes, orig_elems = self.nodes_data.copy(), self.elements_data.copy()
+        if not hasattr(self, "mini_preview_frame"):
+            return
+        orig_nodes = copy.deepcopy(self.model.nodes_data)
+        orig_elems = copy.deepcopy(self.model.elements_data)
         try:
-            if not hasattr(self, 'mini_preview_frame'): return
-            # Clear old mini preview
-            for w in self.mini_canvas_widgets: w.destroy()
+            for w in self.mini_canvas_widgets:
+                w.destroy()
             self.mini_canvas_widgets.clear()
 
-            p = self.template_params
-            if p["span"] <= 0 or p["height"] <= 0: return
+            p = self.model.template_params
+            if p["span"] <= 0 or p["height"] <= 0:
+                return
 
-            profiles = {
-                'top_chord': self.top_chord_profile_var.get(),
-                'bottom_chord': self.bottom_chord_profile_var.get(),
-                'vertical': self.web_profile_var.get(),
-                'diagonal': self.web_profile_var.get()
-            }
-            
-            truss_type = self.selected_template
-            self.nodes_data, self.elements_data = [], []
-            
-            if truss_type == "Howe": self._generate_howe_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Pratt": self._generate_pratt_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Warren": self._generate_warren_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Fan": self._generate_fan_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Fink": self._generate_fink_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "King Post": self._generate_king_post_truss(p["span"], p["height"], profiles)
-            elif truss_type == "Scissors": self._generate_scissors_truss(p["span"], p["height"], p["bottom_height"], p["bays"], profiles)
-            elif truss_type == "Monopith": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Howe")
-            elif truss_type == "Half Howe": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Howe")
-            elif truss_type == "Half Pratt": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Pratt")
-            elif truss_type == "Half Warren": self._generate_mono_truss(p["span"], p["height"], p["bays"], profiles, "Warren")
-            elif truss_type == "Parallel Chord": self._generate_parallel_truss(p["span"], p["height"], p["bays"], profiles)
-            elif truss_type == "Warren (Flat)": self._generate_parallel_truss(p["span"], p["height"], p["bays"], profiles, "Warren")
-            elif truss_type == "Bowstring": self._generate_curved_truss(p["span"], p["height"], p["rise"], p["bays"], profiles, True)
-            elif "Curved Truss" in truss_type: self._generate_curved_truss(p["span"], p["height"], p["rise"], p["bays"], profiles, False)
-            elif truss_type == "Single Cantilever": self._generate_cantilever_truss(p["span"], p["height"], p["cantilever_len"], p["bays"], profiles)
-            elif truss_type == "Double Stub End": self._generate_stub_truss(p["span"], p["height"], p["stub_height"], p["bays"], profiles)
-            
-            # Create Preview Plot
+            profiles = self._get_profiles()
+            nodes, elements = TrussGenerators.generate(self.model.selected_template, p, profiles)
+            self.model.nodes_data = nodes
+            self.model.elements_data = elements
+
             fig, ax = plt.subplots(figsize=(5, 3), dpi=80)
-            ax.set_facecolor('#f0f0f0')
-            fig.patch.set_facecolor('#f0f0f0')
-            
-            # Plot elements
-            for el in self.elements_data:
-                n1, n2 = self.nodes_data[el["node_a"]-1], self.nodes_data[el["node_b"]-1]
-                ax.plot([n1["x"], n2["x"]], [n1["y"], n2["y"]], 'b-', linewidth=1.5)
-            
-            # Plot nodes and supports
-            for n in self.nodes_data:
-                ax.plot(n["x"], n["y"], 'ko', markersize=3)
-                if n["support"] != "Free":
-                    ax.plot(n["x"], n["y"]-0.2, 'r^', markersize=6)
+            fig.patch.set_facecolor("#FFFFFF")
+            ax.set_facecolor("#FFFFFF")
 
-            ax.set_aspect('equal')
-            ax.axis('off')
-            ax.set_title(f"Preview: {truss_type}", fontsize=10)
-            
+            for el in self.model.elements_data:
+                n1 = self.model.nodes_data[el["node_a"] - 1]
+                n2 = self.model.nodes_data[el["node_b"] - 1]
+                ax.plot([n1["x"], n2["x"]], [n1["y"], n2["y"]],
+                        color="#1D4ED8", linewidth=1.5)
+            for n in self.model.nodes_data:
+                ax.plot(n["x"], n["y"], "o", color="#0F172A", markersize=3)
+                if n["support"] != "Free":
+                    ax.plot(n["x"], n["y"] - 0.2, "^", color="#DC2626", markersize=6)
+
+            ax.set_aspect("equal")
+            ax.axis("off")
+            ax.set_title(f"Preview: {self.model.selected_template}",
+                         fontsize=10, color="#0F172A")
+
             canvas = FigureCanvasTkAgg(fig, master=self.mini_preview_frame)
             canvas.draw()
+            plt.close(fig)
             w = canvas.get_tk_widget()
             w.pack(fill="both", expand=True)
             self.mini_canvas_widgets.append(w)
-            
+
         except Exception:
             pass
         finally:
-            # ALWAYS restore original data
-            self.nodes_data, self.elements_data = orig_nodes, orig_elems
-
-
-    def _add_template_loads(self):
-        """Add standard loads to generated template"""
-        mid = len(self.nodes_data) // 2
-        self.loads_data = [
-            {"node_id": mid, "fx": 0, "fy": -50, "case": "DL"},
-            {"node_id": mid, "fx": 0, "fy": -100, "case": "LL"}
-        ]
-
-    # --- Truss Generator Methods ---
-
-    def _generate_warren_truss(self, span, height, n_bays, profiles):
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": i * dx, "y": 0, "support": support})
-            self.nodes_data.append({"x": i * dx, "y": height, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord'], "member_type": "Bottom Chord"})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord'], "member_type": "Top Chord"})
-            if i % 2 == 0:
-                self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal'], "member_type": "Diagonal"})
-            else:
-                self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal'], "member_type": "Diagonal"})
-            self.elements_data.append({"node_a": b1, "node_b": t1, "profile": profiles['vertical'], "member_type": "Vertical"})
-        self.elements_data.append({"node_a": n_bays*2+1, "node_b": n_bays*2+2, "profile": profiles['vertical'], "member_type": "Vertical"})
-
-    def _generate_howe_truss(self, span, height, n_bays, profiles):
-        if n_bays % 2 != 0: n_bays += 1
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            y_top = (x / (span/2)) * height if x <= span/2 else (2 - x / (span/2)) * height
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": 0, "support": support})
-            self.nodes_data.append({"x": x, "y": y_top, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord'], "member_type": "Bottom Chord"})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord'], "member_type": "Top Chord"})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical'], "member_type": "Vertical"})
-            if i < n_bays/2: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal'], "member_type": "Diagonal"})
-            else: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal'], "member_type": "Diagonal"})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical'], "member_type": "Vertical"})
-
-    def _generate_pratt_truss(self, span, height, n_bays, profiles):
-        if n_bays % 2 != 0: n_bays += 1
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            y_top = (x / (span/2)) * height if x <= span/2 else (2 - x / (span/2)) * height
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": 0, "support": support})
-            self.nodes_data.append({"x": x, "y": y_top, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord'], "member_type": "Bottom Chord"})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord'], "member_type": "Top Chord"})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical'], "member_type": "Vertical"})
-            if i < n_bays/2: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal'], "member_type": "Diagonal"})
-            else: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal'], "member_type": "Diagonal"})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical'], "member_type": "Vertical"})
-
-    def _generate_king_post_truss(self, span, height, profiles):
-        self.nodes_data = [
-            {"x": 0, "y": 0, "support": "Pinned"},
-            {"x": span, "y": 0, "support": "Roller"},
-            {"x": span/2, "y": 0, "support": "Free"},
-            {"x": span/2, "y": height, "support": "Free"}
-        ]
-        self.elements_data = [
-            {"node_a": 1, "node_b": 3, "profile": profiles['bottom_chord'], "member_type": "Bottom Chord"},
-            {"node_a": 3, "node_b": 2, "profile": profiles['bottom_chord'], "member_type": "Bottom Chord"},
-            {"node_a": 1, "node_b": 4, "profile": profiles['top_chord'], "member_type": "Top Chord"},
-            {"node_a": 2, "node_b": 4, "profile": profiles['top_chord'], "member_type": "Top Chord"},
-            {"node_a": 3, "node_b": 4, "profile": profiles['vertical'], "member_type": "Vertical"}
-        ]
-
-    def _generate_fink_truss(self, span, height, n_bays, profiles):
-        if n_bays < 4: n_bays = 4
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            y_top = (x / (span/2)) * height if x <= span/2 else (2 - x / (span/2)) * height
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": 0, "support": support})
-            self.nodes_data.append({"x": x, "y": y_top, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            if i == 0 or i == n_bays-1:
-                self.elements_data.append({"node_a": b1 if i==0 else b2, "node_b": t2 if i==0 else t1, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": n_bays+1, "node_b": n_bays+2, "profile": profiles['vertical']}) # simplified Fink
-
-    def _generate_fan_truss(self, span, height, n_bays, profiles):
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": i * dx, "y": 0, "support": support})
-        self.nodes_data.append({"x": span/2, "y": height, "support": "Free"})
-        apex = len(self.nodes_data)
-        for i in range(n_bays):
-            self.elements_data.append({"node_a": i+1, "node_b": i+2, "profile": profiles['bottom_chord']})
-        for i in range(n_bays + 1):
-            self.elements_data.append({"node_a": i+1, "node_b": apex, "profile": profiles['diagonal']})
-
-    def _generate_scissors_truss(self, span, height, bottom_h, n_bays, profiles):
-        if n_bays % 2 != 0: n_bays += 1
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            y_top = (x / (span/2)) * height if x <= span/2 else (2 - x / (span/2)) * height
-            y_bot = (x / (span/2)) * bottom_h if x <= span/2 else (2 - x / (span/2)) * bottom_h
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": y_bot, "support": support})
-            self.nodes_data.append({"x": x, "y": y_top, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical']})
-            if i < n_bays/2: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-            else: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical']})
-
-    def _generate_mono_truss(self, span, height, n_bays, profiles, pattern="Howe"):
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            y_top = (x / span) * height
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": 0, "support": support})
-            self.nodes_data.append({"x": x, "y": y_top, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical']})
-            if pattern == "Howe": self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-            elif pattern == "Pratt": self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal']})
-            else: # Warren
-                if i % 2 == 0: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-                else: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical']})
-
-    def _generate_parallel_truss(self, span, height, n_bays, profiles, pattern="Pratt"):
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": i * dx, "y": 0, "support": support})
-            self.nodes_data.append({"x": i * dx, "y": height, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical']})
-            if pattern == "Warren":
-                if i % 2 == 0: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-                else: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal']})
-            else:
-                if i < n_bays/2: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal']})
-                else: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical']})
-
-    def _generate_curved_truss(self, span, height, rise, n_bays, profiles, bowstring=False):
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            y_top = height + 4 * rise * (x/span) * (1 - x/span)
-            y_bot = 4 * height * (x/span) * (1 - x/span) if not bowstring else 0
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": y_bot, "support": support})
-            self.nodes_data.append({"x": x, "y": y_top, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical']})
-            if i < n_bays/2: self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-            else: self.elements_data.append({"node_a": b2, "node_b": t1, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical']})
-
-    def _generate_cantilever_truss(self, span, height, canti_l, n_bays, profiles):
-        total_l = span + canti_l
-        dx = total_l / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            support = "Pinned" if x < 0.001 else ("Roller" if abs(x - span) < 0.1 else "Free")
-            self.nodes_data.append({"x": x, "y": 0, "support": support})
-            self.nodes_data.append({"x": x, "y": height, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical']})
-            self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical']})
-
-    def _generate_stub_truss(self, span, height, stub_h, n_bays, profiles):
-        dx = span / n_bays
-        for i in range(n_bays + 1):
-            x = i * dx
-            support = "Pinned" if i == 0 else ("Roller" if i == n_bays else "Free")
-            self.nodes_data.append({"x": x, "y": 0, "support": support})
-            self.nodes_data.append({"x": x, "y": height + stub_h, "support": "Free"})
-        for i in range(n_bays):
-            b1, t1, b2, t2 = i*2+1, i*2+2, (i+1)*2+1, (i+1)*2+2
-            self.elements_data.append({"node_a": b1, "node_b": b2, "profile": profiles['bottom_chord']})
-            self.elements_data.append({"node_a": t1, "node_b": t2, "profile": profiles['top_chord']})
-            self.elements_data.append({"node_a": b2, "node_b": t2, "profile": profiles['vertical']})
-            self.elements_data.append({"node_a": b1, "node_b": t2, "profile": profiles['diagonal']})
-        self.elements_data.append({"node_a": 1, "node_b": 2, "profile": profiles['vertical']})
+            self.model.nodes_data = orig_nodes
+            self.model.elements_data = orig_elems
 
     def save_project(self):
-        self.sync_data(); f = filedialog.asksaveasfilename(defaultextension=".json")
+        if not self.sync_data():
+            return
+        f = filedialog.asksaveasfilename(defaultextension=".json")
         if f:
-            with open(f, "w") as j: json.dump({"nodes": self.nodes_data, "elems": self.elements_data, "loads": self.loads_data}, j)
+            with open(f, "w", encoding="utf-8") as j:
+                json.dump(self.model.to_dict(), j, indent=2)
 
     def load_project(self):
         f = filedialog.askopenfilename()
         if f:
-            with open(f, "r") as j: d = json.load(j); self.nodes_data, self.elements_data, self.loads_data = d["nodes"], d["elems"], d["loads"]; self.refresh_ui()
+            with open(f, "r", encoding="utf-8") as j:
+                self.model.from_dict(json.load(j))
+            self.refresh_ui()
 
     def export_csv(self):
-        if not self.ss: return
+        if not self.ss:
+            return
         f = filedialog.asksaveasfilename(defaultextension=".csv")
         if f:
-            with open(f, "w", newline="") as c:
-                w = csv.writer(c); w.writerow(["Member", "Force", "Stress"])
-                for elem_id in self.ss.element_map:
-                    r = self.ss.get_element_results(element_id=elem_id)
-                    force = r.get("N", 0.0)
-                    w.writerow([f"E{elem_id}", f"{force:.2f}", "Tension" if force>0 else "Compression"])
+            TrussExporter.export_csv(self.ss, f)
             messagebox.showinfo("Success", "Exported CSV!")
 
     def export_report(self):
-        """Export a professional PDF analysis report mirroring the continuous_beam_gui style"""
         if not self.analysis_results:
-            messagebox.showwarning("Warning", "No analysis results to export. Run analysis first.")
+            messagebox.showwarning("Warning", "No analysis results. Run analysis first.")
             return
-            
-        fpath = filedialog.asksaveasfilename(
+        f = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF Documents", "*.pdf")],
-            title="Save Structural Analysis Report"
+            title="Save Structural Analysis Report",
         )
-        
-        if not fpath:
+        if not f:
             return
-            
         try:
-            import io
-            import datetime
-            from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4
-            from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-            from reportlab.pdfbase import pdfmetrics
-            from reportlab.pdfbase.ttfonts import TTFont
-            from reportlab.platypus import Image as RLImage
-            from reportlab.platypus import (
-                Paragraph,
-                SimpleDocTemplate,
-                Spacer,
-                Table,
-                TableStyle,
-                PageBreak
+            merged_combos_pdf = {
+                method: {**LOAD_COMBINATIONS[method],
+                         **self.model.custom_combinations.get(method, {})}
+                for method in LOAD_COMBINATIONS
+            }
+            TrussExporter.export_pdf(
+                self.model, self.ss, self.analysis_results, f,
+                self.scale_support_symbols, self.add_dimensions,
+                STEEL_GRADES=STEEL_GRADES,
+                STEEL_PROFILES=STEEL_PROFILES,
+                LOAD_COMBINATIONS=merged_combos_pdf,
             )
-
-            # --- Font Registration (Thai support) ---
-            font_name = "Helvetica"
-            try:
-                tahoma_path = r"C:\Windows\Fonts\tahoma.ttf"
-                if os.path.exists(tahoma_path):
-                    pdfmetrics.registerFont(TTFont("Tahoma", tahoma_path))
-                    tahoma_b_path = r"C:\Windows\Fonts\tahomabd.ttf"
-                    if os.path.exists(tahoma_b_path):
-                        pdfmetrics.registerFont(TTFont("Tahoma-Bold", tahoma_b_path))
-                    font_name = "Tahoma"
-            except: pass
-            
-            b_font = font_name + "-Bold" if font_name == "Tahoma" else "Helvetica-Bold"
-
-            # --- Document Setup ---
-            doc = SimpleDocTemplate(
-                fpath,
-                pagesize=A4,
-                rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40
-            )
-            elements = []
-            styles = getSampleStyleSheet()
-
-            # --- Custom Styles ---
-            title_style = ParagraphStyle("Title", parent=styles["Heading1"], fontName=b_font, fontSize=20,
-                                       textColor=colors.HexColor("#2563EB"), alignment=1, spaceAfter=10)
-            h2_style = ParagraphStyle("H2", parent=styles["Heading2"], fontName=b_font, fontSize=14,
-                                     textColor=colors.HexColor("#1F2937"), spaceBefore=15, spaceAfter=10)
-            normal_style = ParagraphStyle("Normal", parent=styles["Normal"], fontName=font_name, fontSize=10)
-            
-            # --- 1. Header & Project Info ---
-            elements.append(Paragraph("🏗️ Structural Analysis Report", title_style))
-            elements.append(Paragraph(f"Advanced Truss Analyzer PRO v3.0", ParagraphStyle("Sub", alignment=1, fontSize=10, textColor=colors.gray)))
-            elements.append(Spacer(1, 20))
-
-            proj_table_data = [
-                [Paragraph(f"<b>Project:</b> {self.project_data['name']}", normal_style), 
-                 Paragraph(f"<b>Date:</b> {self.project_data['date']}", normal_style)],
-                [Paragraph(f"<b>Engineer:</b> {self.project_data['engineer']}", normal_style), 
-                 Paragraph(f"<b>Location:</b> {self.project_data['location']}", normal_style)],
-                [Paragraph(f"<b>Method:</b> {self.design_method}", normal_style), 
-                 Paragraph(f"<b>Combination:</b> {self.selected_combo}", normal_style)]
-            ]
-            t_proj = Table(proj_table_data, colWidths=[250, 250])
-            t_proj.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP'), ('BOTTOMPADDING', (0,0), (-1,-1), 5)]))
-            elements.append(t_proj)
-            elements.append(Spacer(1, 10))
-            elements.append(ctk.CTkLabel(self, text="")._canvas.postscript() if False else Spacer(1, 2)) # separator
-
-            # --- 2. Diagrams Integration ---
-            def fig_to_image(fig, width_ratio=1.0):
-                buf = io.BytesIO()
-                fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor="white")
-                buf.seek(0)
-                img = RLImage(buf)
-                target_w = 515 * width_ratio # A4 usable width
-                aspect = img.drawHeight / float(img.drawWidth)
-                img.drawWidth = target_w
-                img.drawHeight = target_w * aspect
-                img.hAlign = "CENTER"
-                return img
-
-            # 2.1 Structure Model
-            elements.append(Paragraph("1. Structure Model", h2_style))
-            fig_struct = self.ss.show_structure(show=False)
-            self.scale_support_symbols(fig_struct)
-            self.add_dimensions(fig_struct)
-            elements.append(fig_to_image(fig_struct))
-            plt.close(fig_struct)
-            
-            # 2.2 Axial Force Diagram (Custom drawing for report)
-            elements.append(Paragraph("2. Axial Force Diagram", h2_style))
-            # Create a dedicated high-quality axial plot for PDF
-            fig_ax, ax = plt.subplots(figsize=(10, 5))
-            # ... replication of visualization logic from update_enhanced_plots ...
-            # (Simplified for the sake of tool call limits, but keeping the core visuals)
-            for i, result in enumerate(self.analysis_results):
-                elem = self.ss.elements[i+1]
-                force = result["force"]
-                color = '#E74C3C' if force > 0.1 else ('#2980B9' if force < -0.1 else '#7F8C8D')
-                ax.plot([elem['start'][0], elem['end'][0]], [elem['start'][1], elem['end'][1]], color=color, lw=2)
-            ax.set_aspect('equal'); ax.axis('off')
-            elements.append(fig_to_image(fig_ax))
-            plt.close(fig_ax)
-
-            elements.append(PageBreak())
-
-            # 2.3 Utilization Diagram
-            elements.append(Paragraph("3. Member Utilization (Pass/Fail)", h2_style))
-            fig_u, ax = plt.subplots(figsize=(10, 5))
-            for i, result in enumerate(self.analysis_results):
-                elem = self.ss.elements[i+1]
-                util = result["utilization"]
-                color = '#27AE60' if util <= 1.0 else '#E74C3C'
-                ax.plot([elem['start'][0], elem['end'][0]], [elem['start'][1], elem['end'][1]], color=color, lw=3)
-                # Label
-                mx, my = (elem['start'][0] + elem['end'][0])/2, (elem['start'][1] + elem['end'][1])/2
-                ax.text(mx, my, f"{util:.2f}", fontsize=8, ha='center', bbox=dict(boxstyle="round,pad=0.1", fc='white', alpha=0.7))
-            ax.set_aspect('equal'); ax.axis('off')
-            elements.append(fig_to_image(fig_u))
-            plt.close(fig_u)
-
-            # --- 3. Tables Section ---
-            
-            # 3.1 Results Table
-            elements.append(Paragraph("4. Member Analysis Results", h2_style))
-            res_header = ["Member", "Profile", "Force (kN)", "Type", "Util.", "Status"]
-            res_data = [res_header]
-            for r in self.analysis_results:
-                res_data.append([
-                    r["member_id"], r["profile"], f"{r['force']:.2f}",
-                    r["type"], f"{r['utilization']:.2f}", "OK" if r["status"] == "OK" else "FAIL"
-                ])
-            
-            t_res = Table(res_data, colWidths=[60, 140, 80, 80, 60, 60])
-            t_res.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#D5D8DC")),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-                ('FONTNAME', (0, 0), (-1, 0), b_font),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.whitesmoke),
-            ]))
-            # Apply red color to failures
-            for i, r in enumerate(self.analysis_results):
-                if r["status"] == "FAIL":
-                    t_res.setStyle(TableStyle([('TEXTCOLOR', (5, i+1), (5, i+1), colors.red),
-                                              ('FONTNAME', (5, i+1), (5, i+1), b_font)]))
-            elements.append(t_res)
-
-            # 3.2 Nodes Table
-            elements.append(Paragraph("5. Node Coordinates & Supports", h2_style))
-            node_header = ["Node ID", "X Coord (m)", "Y Coord (m)", "Support Type"]
-            node_data = [node_header]
-            for i, n in enumerate(self.nodes_data):
-                node_data.append([f"N{i+1}", f"{n['x']:.3f}", f"{n['y']:.3f}", n["support"]])
-            
-            t_node = Table(node_data, colWidths=[100, 120, 120, 140])
-            t_node.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#EAEDED")),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('FONTNAME', (0, 0), (-1, 0), b_font),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ]))
-            elements.append(t_node)
-
-            # --- Footer function ---
-            def draw_footer(canvas, doc_obj):
-                canvas.saveState()
-                canvas.setFont(font_name, 8)
-                canvas.setFillColor(colors.gray)
-                footer_txt = f"Page {doc_obj.page}  |  Generated by Advanced Truss Analyzer PRO"
-                canvas.drawRightString(A4[0] - 40, 20, footer_txt)
-                canvas.restoreState()
-
-            # Build PDF
-            doc.build(elements, onFirstPage=draw_footer, onLaterPages=draw_footer)
-            messagebox.showinfo("Success", f"Professional PDF Report generated successfully!\nLocation: {fpath}")
-
+            messagebox.showinfo("Success", f"PDF Report generated!\n{f}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            messagebox.showerror("Export Error", f"Failed to generate PDF: {str(e)}")
+            import traceback; traceback.print_exc()
+            messagebox.showerror("Export Error", f"Failed to generate PDF: {e}")
 
 if __name__ == "__main__":
     app = TrussAnalyzerPro()
